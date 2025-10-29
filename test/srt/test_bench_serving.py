@@ -1,8 +1,13 @@
 import asyncio
 import itertools
+import json
 import unittest
 
+import pytest
 import requests
+
+pytest.importorskip("torch")
+pytest.importorskip("triton")
 
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
@@ -11,12 +16,14 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     is_in_amd_ci,
     is_in_ci,
     run_bench_serving,
+    run_embedding_benchmark,
     run_score_benchmark,
     write_github_step_summary,
 )
@@ -507,6 +514,87 @@ class TestBenchServing(CustomTestCase):
             else:
                 p95_latency_bound = 65
             self.assertLess(res["p95_latency_ms"], p95_latency_bound)
+
+    def test_embedding_api_latency_throughput(self):
+        """Benchmark embeddings API latency and throughput"""
+
+        other_args = ["--is-embedding", "--enable-metrics"]
+        res = run_embedding_benchmark(
+            model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+            num_requests=300,
+            batch_size=8,
+            other_server_args=other_args,
+            need_warmup=True,
+            input_token_length=256,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                "### test_embedding_api_latency_throughput\n"
+                f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                f"Embedding throughput: {res['throughput']:.2f} req/s\n"
+                f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+            )
+
+        self.assertEqual(res["successful_requests"], res["total_requests"])
+        self.assertGreater(res["throughput"], 12)
+        self.assertLess(res["avg_latency_ms"], 70)
+        self.assertLess(res["p95_latency_ms"], 85)
+        self.assertTrue(all(length > 0 for length in res["embedding_lengths"]))
+
+    def test_embedding_matryoshka_dimensions(self):
+        """Benchmark embeddings API with Matryoshka dimensions"""
+
+        matryoshka_dims = [128, 256, 512, 768]
+        matryoshka_config = {
+            "is_matryoshka": True,
+            "matryoshka_dimensions": matryoshka_dims,
+        }
+        other_args = [
+            "--is-embedding",
+            "--enable-metrics",
+            "--json-model-override-args",
+            json.dumps(matryoshka_config),
+        ]
+        res = run_embedding_benchmark(
+            model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+            num_requests=len(matryoshka_dims) * 60,
+            batch_size=4,
+            other_server_args=other_args,
+            need_warmup=True,
+            input_token_length=256,
+            matryoshka_dimensions=matryoshka_dims,
+        )
+
+        if is_in_ci():
+            dims_summary = ", ".join(sorted(str(dim) for dim in set(res["embedding_lengths"])))
+            write_github_step_summary(
+                "### test_embedding_matryoshka_dimensions\n"
+                f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                f"Embedding throughput: {res['throughput']:.2f} req/s\n"
+                f"Observed dimensions: {dims_summary}\n"
+            )
+
+        self.assertEqual(res["successful_requests"], res["total_requests"])
+        self.assertGreater(res["throughput"], 10)
+        self.assertLess(res["avg_latency_ms"], 75)
+        self.assertLess(res["p95_latency_ms"], 90)
+        self.assertEqual(
+            len(res["embedding_lengths"]), len(res["requested_dimensions"])
+        )
+
+        observed_requested = {
+            dim for dim in res["requested_dimensions"] if dim is not None
+        }
+        self.assertTrue(observed_requested)
+        self.assertEqual(observed_requested, set(matryoshka_dims))
+        for expected_dim, actual_dim in zip(
+            res["requested_dimensions"], res["embedding_lengths"]
+        ):
+            if expected_dim is not None:
+                self.assertEqual(actual_dim, expected_dim)
 
 
 if __name__ == "__main__":

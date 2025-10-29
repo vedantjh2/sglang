@@ -19,7 +19,7 @@ from datetime import datetime
 from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, List, Optional, Sequence, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -784,7 +784,9 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
 
 def get_similarities(vec1, vec2):
-    return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
+    vec1_tensor = torch.tensor(vec1, dtype=torch.float32)
+    vec2_tensor = torch.tensor(vec2, dtype=torch.float32)
+    return float(F.cosine_similarity(vec1_tensor, vec2_tensor, dim=0))
 
 
 def get_benchmark_args(
@@ -1057,6 +1059,201 @@ def run_score_benchmark(
                 "p95_latency_ms": 0,
                 "successful_requests": 0,
             }
+
+    try:
+        res = asyncio.run(_run_benchmark())
+    finally:
+        kill_process_tree(process.pid)
+
+    assert res["completed"] == res["successful_requests"]
+    return res
+
+
+def run_embedding_benchmark(
+    model: str,
+    num_requests: int = 200,
+    batch_size: int = 4,
+    other_server_args: Optional[list[str]] = None,
+    need_warmup: bool = False,
+    device: str = "auto",
+    input_token_length: int = 256,
+    matryoshka_dimensions: Optional[Union[int, Sequence[int]]] = None,
+):
+    """Benchmark the embeddings API throughput and latency."""
+
+    if other_server_args is None:
+        other_server_args = []
+
+    server_args = list(other_server_args)
+    if device != "auto":
+        server_args += ["--device", str(device)]
+
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=server_args,
+    )
+
+    async def _run_benchmark():
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+        special_token = "<|im_start|>"
+
+        def generate_text_with_token_count(num_tokens: int) -> str:
+            base_text = special_token * num_tokens
+            encoded = tokenizer.encode(base_text, add_special_tokens=False)
+            if len(encoded) == num_tokens:
+                return base_text
+
+            token_count = len(tokenizer.encode(special_token, add_special_tokens=False))
+            if token_count <= 1:
+                repetitions = num_tokens
+            else:
+                repetitions = (num_tokens + token_count - 1) // token_count
+            text = special_token * repetitions
+            if repetitions > num_tokens:
+                trimmed = tokenizer.encode(text, add_special_tokens=False)[:num_tokens]
+                text = tokenizer.decode(trimmed)
+            return text
+
+        if need_warmup:
+            warmup_inputs = [
+                generate_text_with_token_count(input_token_length)
+                for _ in range(max(1, batch_size))
+            ]
+            warmup_payload = {
+                "input": warmup_inputs[0] if batch_size == 1 else warmup_inputs,
+                "model": model,
+            }
+            if isinstance(matryoshka_dimensions, Sequence) and not isinstance(
+                matryoshka_dimensions, (str, bytes)
+            ):
+                dims = matryoshka_dimensions[0] if matryoshka_dimensions else None
+            else:
+                dims = matryoshka_dimensions
+            if dims:
+                warmup_payload["dimensions"] = dims
+
+            async with aiohttp.ClientSession() as session:
+                try:
+                    await session.post(
+                        f"{base_url}/v1/embeddings",
+                        json=warmup_payload,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    )
+                except Exception:
+                    pass
+
+        request_payloads: List[Tuple[dict, Optional[int]]] = []
+        if isinstance(matryoshka_dimensions, Sequence) and not isinstance(
+            matryoshka_dimensions, (str, bytes)
+        ):
+            dims_sequence = list(matryoshka_dimensions)
+        else:
+            dims_sequence = [matryoshka_dimensions] if matryoshka_dimensions else []
+
+        for idx in range(num_requests):
+            request_inputs = [
+                generate_text_with_token_count(input_token_length)
+                for _ in range(batch_size)
+            ]
+            payload = {
+                "input": request_inputs[0] if batch_size == 1 else request_inputs,
+                "model": model,
+            }
+
+            if dims_sequence:
+                dims = dims_sequence[idx % len(dims_sequence)]
+            else:
+                dims = matryoshka_dimensions if isinstance(matryoshka_dimensions, int) else None
+
+            if dims:
+                payload["dimensions"] = dims
+
+            request_payloads.append((payload, dims))
+
+        start_time = time.monotonic()
+        successful_requests = 0
+        latencies_ms: List[float] = []
+        total_latency = 0.0
+        embedding_lengths: List[int] = []
+        requested_dimensions: List[Optional[int]] = []
+
+        async with aiohttp.ClientSession() as session:
+            for payload, dims in request_payloads:
+                try:
+                    request_start = time.monotonic()
+                    async with session.post(
+                        f"{base_url}/v1/embeddings",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as response:
+                        if response.status != 200:
+                            continue
+
+                        response_data = await response.json()
+                        data_items = response_data.get("data", [])
+                        if not data_items:
+                            continue
+
+                        lengths = []
+                        valid = True
+                        for item in data_items:
+                            embedding = item.get("embedding", [])
+                            length = len(embedding)
+                            if length == 0:
+                                valid = False
+                                break
+                            if dims and length != dims:
+                                valid = False
+                                break
+                            lengths.append(length)
+
+                        if not valid:
+                            continue
+
+                        request_end = time.monotonic()
+                        latency_ms = (request_end - request_start) * 1000
+                        latencies_ms.append(latency_ms)
+                        total_latency += latency_ms
+                        successful_requests += 1
+                        embedding_lengths.extend(lengths)
+                        requested_dimensions.extend([dims] * len(lengths))
+                except Exception:
+                    continue
+
+        end_time = time.monotonic()
+        total_time = end_time - start_time
+
+        if successful_requests == 0 or total_time <= 0:
+            return {
+                "completed": 0,
+                "total_requests": len(request_payloads),
+                "throughput": 0.0,
+                "avg_latency_ms": 0.0,
+                "p95_latency_ms": 0.0,
+                "successful_requests": 0,
+                "embedding_lengths": embedding_lengths,
+                "requested_dimensions": requested_dimensions,
+            }
+
+        throughput = successful_requests / total_time
+        avg_latency = total_latency / successful_requests if successful_requests else 0.0
+        p95_latency = float(np.percentile(latencies_ms, 95)) if latencies_ms else 0.0
+
+        return {
+            "completed": successful_requests,
+            "total_requests": len(request_payloads),
+            "throughput": throughput,
+            "avg_latency_ms": avg_latency,
+            "p95_latency_ms": p95_latency,
+            "successful_requests": successful_requests,
+            "embedding_lengths": embedding_lengths,
+            "requested_dimensions": requested_dimensions,
+        }
 
     try:
         res = asyncio.run(_run_benchmark())

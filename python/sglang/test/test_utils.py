@@ -784,9 +784,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
 
 def get_similarities(vec1, vec2):
-    vec1_tensor = torch.tensor(vec1, dtype=torch.float32)
-    vec2_tensor = torch.tensor(vec2, dtype=torch.float32)
-    return float(F.cosine_similarity(vec1_tensor, vec2_tensor, dim=0))
+    return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
 
 
 def get_benchmark_args(

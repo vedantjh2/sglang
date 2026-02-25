@@ -332,7 +332,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         context = get_forward_context()
         if context is not None and context.lora_backend is not None:
             # PCG path: use custom ops so torch.compile treats them as opaque
-            lora_a_output = torch.zeros(
+            lora_a_output = torch.empty(
                 x.shape[0], self.A_buffer.shape[-2],
                 dtype=x.dtype, device=x.device,
             )
@@ -552,7 +552,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         context = get_forward_context()
         if context is not None and context.lora_backend is not None:
             # PCG path: use custom ops so torch.compile treats them as opaque
-            lora_a_output = torch.zeros(
+            lora_a_output = torch.empty(
                 x.shape[0], self.A_buffer.shape[-2],
                 dtype=x.dtype, device=x.device,
             )

@@ -12,6 +12,7 @@ import torch.fx as fx
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
     get_pcg_capture_stream,
     is_in_pcg_torch_compile,
 )
@@ -141,6 +142,12 @@ class CUDAPiecewiseBackend:
                 self.check_for_ending_compilation()
 
         if is_in_pcg_torch_compile():
+            return entry.runnable(*args)
+
+        # Skip CUDA graph replay for LoRA batches — run compiled code directly
+        ctx = get_forward_context()
+        skip_cuda_graphs = ctx.skip_cuda_graphs if ctx is not None else False
+        if not entry.use_cudagraph or skip_cuda_graphs:
             return entry.runnable(*args)
 
         if entry.cudagraph is None:

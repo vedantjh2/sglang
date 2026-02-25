@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     split_tensor_along_last_dim,
@@ -22,6 +23,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
+
+# Trigger custom op registration for PCG + LoRA
+import sglang.srt.lora.lora_custom_ops  # noqa: F401
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -325,6 +329,16 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        context = get_forward_context()
+        if context is not None and context.lora_backend is not None:
+            # PCG path: use custom ops so torch.compile treats them as opaque
+            lora_a_output = torch.zeros(
+                x.shape[0], self.A_buffer.shape[-2],
+                dtype=x.dtype, device=x.device,
+            )
+            torch.ops.sglang.lora_a_sgemm(x, self.A_buffer, lora_a_output, 1)
+            torch.ops.sglang.lora_b_sgemm(lora_a_output, self.B_buffer, base_output)
+            return base_output
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
@@ -391,6 +405,15 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        context = get_forward_context()
+        if context is not None and context.lora_backend is not None:
+            # PCG path: use fused gate_up custom op
+            output_dim = self.B_buffer_gate_up.shape[-2] // 2
+            torch.ops.sglang.gate_up_lora(
+                x, self.A_buffer_gate_up, self.B_buffer_gate_up,
+                base_output, output_dim,
+            )
+            return base_output
         lora_output = self.lora_backend.run_gate_up_lora(
             x=x,
             gate_up_lora_a=self.A_buffer_gate_up,
@@ -452,6 +475,14 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.B_buffer_qkv = B_buffer_qkv
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        context = get_forward_context()
+        if context is not None and context.lora_backend is not None:
+            # PCG path: use fused QKV custom op
+            torch.ops.sglang.qkv_lora(
+                x, self.A_buffer_qkv, self.B_buffer_qkv,
+                base_output, self.output_offset, self.max_qkv_out_dim,
+            )
+            return base_output
         lora_output = self.lora_backend.run_qkv_lora(
             x=x,
             qkv_lora_a=self.A_buffer_qkv,
@@ -518,6 +549,16 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        context = get_forward_context()
+        if context is not None and context.lora_backend is not None:
+            # PCG path: use custom ops so torch.compile treats them as opaque
+            lora_a_output = torch.zeros(
+                x.shape[0], self.A_buffer.shape[-2],
+                dtype=x.dtype, device=x.device,
+            )
+            torch.ops.sglang.lora_a_sgemm(x, self.A_buffer, lora_a_output, 1)
+            torch.ops.sglang.lora_b_sgemm(lora_a_output, self.B_buffer, base_output)
+            return base_output
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,

@@ -31,6 +31,8 @@ from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
+    get_is_capture_mode,
+    set_capture_mode,
     set_forward_context,
     set_pcg_capture_stream,
 )
@@ -265,6 +267,11 @@ class PiecewiseCudaGraphRunner:
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
+        self.lora_backend = (
+            self.model_runner.lora_manager.lora_backend
+            if self.model_runner.server_args.enable_lora
+            else None
+        )
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -304,9 +311,10 @@ class PiecewiseCudaGraphRunner:
 
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
-                # Capture
+                # Capture — mark capture mode so custom LoRA ops are no-ops
                 try:
-                    self.capture()
+                    with set_capture_mode():
+                        self.capture()
                 except RuntimeError as e:
                     raise Exception(
                         f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
@@ -384,7 +392,7 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                lora_ids=[None] * 1 if self.lora_backend is not None else None,
             )
 
         # Attention backend
@@ -392,12 +400,18 @@ class PiecewiseCudaGraphRunner:
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
+
+        # Prepare LoRA batch info for warmup so LoRA layers can execute
+        if self.lora_backend is not None:
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+
         with set_forward_context(
             forward_batch,
             self.attention_layers,
             self.quant_config,
             self.moe_layers,
             self.moe_fusions,
+            lora_backend=self.lora_backend,
         ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -538,11 +552,14 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                lora_ids=lora_ids,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
-        if lora_ids is not None:
+        if lora_ids is not None and not get_is_capture_mode():
+            # During capture, custom ops no-op so batch_info is not needed.
+            # Also, uid=None may not be in the memory pool yet, so
+            # prepare_lora_batch would crash on get_buffer_id(None).
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -567,6 +584,7 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                lora_backend=self.lora_backend,
             ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -731,6 +749,14 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        # Determine if this batch has LoRA requests — if so, skip CUDA graph
+        # replay and run compiled code directly so LoRA custom ops execute.
+        skip_cuda_graphs = False
+        if self.lora_backend is not None and forward_batch.lora_ids is not None:
+            skip_cuda_graphs = any(
+                lid is not None for lid in forward_batch.lora_ids
+            )
+
         with enable_piecewise_cuda_graph():
             # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -742,6 +768,8 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                lora_backend=self.lora_backend,
+                skip_cuda_graphs=skip_cuda_graphs,
             ):
                 with set_compiled(True):
                     output = self.model_runner.model.forward(

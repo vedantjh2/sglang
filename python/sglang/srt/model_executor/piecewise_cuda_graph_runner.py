@@ -275,11 +275,24 @@ class PiecewiseCudaGraphRunner:
             # LoRA triton kernels will be captured INSIDE the CUDA graphs:
             # they use these static tensors (by pointer), and we update the
             # tensor data in-place before each replay.
+            #
+            # The triton kernel grid's batch dimension (`bs`) is baked into the
+            # CUDA graph at capture time. We capture with bs=1 for optimal
+            # kernel performance (zero overhead from no-op blocks). During
+            # replay, all tokens are treated as a single segment with one
+            # adapter. Batches with mixed adapters are rejected by can_run()
+            # and fall back to the non-graph forward path.
+            self.pcg_lora_bs = 1
             max_num_tokens = max(self.capture_num_tokens)
             self.model_runner.lora_manager.init_cuda_graph_batch_info(
-                max_bs_in_cuda_graph=1,
+                max_bs_in_cuda_graph=self.pcg_lora_bs,
                 num_tokens_per_bs=max_num_tokens,
             )
+            # Pre-allocate pinned CPU buffers for async H2D transfers in replay.
+            # This avoids per-replay pinned memory allocation overhead.
+            self._pcg_seg_lens_buf = torch.zeros(1, dtype=torch.int32).pin_memory()
+            self._pcg_seg_indptr_buf = torch.zeros(2, dtype=torch.int32).pin_memory()
+            self._pcg_weight_idx_buf = torch.zeros(1, dtype=torch.int32).pin_memory()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -437,9 +450,17 @@ class PiecewiseCudaGraphRunner:
             ):
                 if start_len is not None and start_len < seq_len:
                     return False
-        if num_tokens <= self.max_num_tokens:
-            return True
-        return False
+        if num_tokens > self.max_num_tokens:
+            return False
+        # PCG LoRA captures with bs=1 (single segment). Batches with mixed
+        # adapters must fall back to the non-graph path which supports
+        # multi-adapter natively via the original uncompiled forward.
+        if self.lora_backend is not None and forward_batch.lora_ids is not None:
+            first_lora = forward_batch.lora_ids[0]
+            for lid in forward_batch.lora_ids[1:]:
+                if lid != first_lora:
+                    return False
+        return True
 
     def capture(self) -> None:
         # Trigger CUDA graph capture for specific shapes.
@@ -568,15 +589,20 @@ class PiecewiseCudaGraphRunner:
             # (Python ints), which get baked into the CUDA graph at capture time.
             # The tensor pointers (seg_lens, seg_indptr, weight_indices, etc.)
             # are also captured; we update their DATA in-place before replay.
+            #
+            # Capture with bs=1: single segment covering all tokens.
+            # All lora_ranks=0 during capture so the kernel no-ops.
+            # During replay, can_run() guarantees single-adapter batches.
             cg_bi = self.lora_backend.cuda_graph_batch_info
             cg_bi.bs = 1
             cg_bi.num_segments = 1
             cg_bi.max_len = num_tokens
+            # Single segment gets all tokens
             cg_bi.seg_lens[0] = num_tokens
             cg_bi.seg_indptr[0] = 0
             cg_bi.seg_indptr[1] = num_tokens
-            # weight_indices=0, lora_ranks=0, scalings=0 → kernels no-op (rank==0)
-            cg_bi.weight_indices.zero_()
+            # weight_indices=0, lora_ranks=0, scalings=0 → kernel no-ops (rank==0)
+            cg_bi.weight_indices[0] = 0
             cg_bi.lora_ranks.zero_()
             cg_bi.scalings.zero_()
             self.lora_backend.batch_info = cg_bi
@@ -776,29 +802,38 @@ class PiecewiseCudaGraphRunner:
         # replayed triton kernels see the correct weight_indices / ranks / scalings.
         # prepare_lora_batch was already called during ForwardBatch.init_new()
         # with use_cuda_graph=False, so lora_backend.batch_info has correct
-        # data in freshly-allocated tensors.  We copy that data into the
-        # pre-allocated static tensors whose pointers were captured in the graph.
+        # data in freshly-allocated tensors (src_bi).
         #
-        # PCG always captures with bs=1, so the triton kernel grid's batch
-        # dimension is 1.  We consolidate multi-sequence batches into a single
-        # segment: seg_lens[0] = total_tokens, using the first request's
-        # adapter.  This is correct when all sequences use the same adapter
-        # (the common case for embedding workloads).  The kernel's
-        # `if rank == 0: return` guard handles non-LoRA batches.
+        # The graph was captured with bs=1 (single segment). can_run()
+        # guarantees all requests use the same adapter. We just update:
+        #   - seg_lens[0] = total tokens in batch
+        #   - seg_indptr = [0, total_tokens]
+        #   - weight_indices[0] = adapter index
+        #   - lora_ranks, scalings (per-adapter data)
+        # All copies use pre-allocated pinned buffers → zero GPU sync.
         if self.lora_backend is not None and self.lora_backend.cuda_graph_batch_info is not None:
             src_bi = self.lora_backend.batch_info
             cg_bi = self.lora_backend.cuda_graph_batch_info
             num_tokens = len(forward_batch.input_ids)
-            # Single-segment view (bs=1) to match the captured kernel grid
-            cg_bi.bs = 1
-            cg_bi.num_segments = 1
-            cg_bi.seg_lens[0] = num_tokens
-            cg_bi.seg_indptr[0] = 0
-            cg_bi.seg_indptr[1] = num_tokens
-            # Use first request's adapter index (all requests assumed same adapter)
-            cg_bi.weight_indices[0] = src_bi.weight_indices[0]
+
+            # Get adapter index from CPU-side data (stored by prepare_lora_batch)
+            adapter_idx = self.lora_backend._cpu_weight_indices[0]
+
+            # Update static tensors using pre-allocated pinned buffers (async H2D)
+            self._pcg_seg_lens_buf[0] = num_tokens
+            cg_bi.seg_lens[:1].copy_(self._pcg_seg_lens_buf, non_blocking=True)
+
+            self._pcg_seg_indptr_buf[0] = 0
+            self._pcg_seg_indptr_buf[1] = num_tokens
+            cg_bi.seg_indptr[:2].copy_(self._pcg_seg_indptr_buf, non_blocking=True)
+
+            self._pcg_weight_idx_buf[0] = adapter_idx
+            cg_bi.weight_indices[:1].copy_(self._pcg_weight_idx_buf, non_blocking=True)
+
+            # Copy per-adapter ranks and scalings (GPU→GPU, async)
             cg_bi.lora_ranks.copy_(src_bi.lora_ranks, non_blocking=True)
             cg_bi.scalings.copy_(src_bi.scalings, non_blocking=True)
+
             self.lora_backend.batch_info = cg_bi
 
         # Replay

@@ -31,6 +31,7 @@ from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
+    set_capture_mode,
     set_forward_context,
     set_pcg_capture_stream,
 )
@@ -266,6 +267,11 @@ class PiecewiseCudaGraphRunner:
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
 
+        # Get lora_backend if LoRA is enabled, for passing into forward context
+        self.lora_backend = None
+        if self.model_runner.server_args.enable_lora:
+            self.lora_backend = self.model_runner.lora_manager.lora_backend
+
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
@@ -384,8 +390,12 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                lora_ids=[None] if self.lora_backend is not None else None,
             )
+
+        # Prepare LoRA batch info for warmup so LoRA layers can execute
+        if self.lora_backend is not None:
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -398,6 +408,7 @@ class PiecewiseCudaGraphRunner:
             self.quant_config,
             self.moe_layers,
             self.moe_fusions,
+            lora_backend=self.lora_backend,
         ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -452,7 +463,7 @@ class PiecewiseCudaGraphRunner:
                             f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                         )
 
-                    with set_compiled(True):
+                    with set_compiled(True), set_capture_mode():
                         self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
@@ -538,7 +549,7 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                lora_ids=lora_ids,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -567,6 +578,7 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                lora_backend=self.lora_backend,
             ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -731,44 +743,56 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        with enable_piecewise_cuda_graph():
-            # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
-            # Replay
-            with set_forward_context(
-                static_forward_batch,
-                self.attention_layers,
-                self.quant_config,
-                self.moe_layers,
-                self.moe_fusions,
-            ):
-                with set_compiled(True):
-                    output = self.model_runner.model.forward(
-                        static_forward_batch.input_ids,
-                        static_forward_batch.positions,
-                        static_forward_batch,
-                        **kwargs,
-                    )
-                if isinstance(output, LogitsProcessorOutput):
-                    return LogitsProcessorOutput(
-                        next_token_logits=output.next_token_logits[
-                            : self.raw_num_tokens
-                        ],
-                        hidden_states=(
-                            output.hidden_states[: self.raw_num_tokens]
-                            if output.hidden_states is not None
-                            else None
-                        ),
-                    )
-                elif isinstance(output, EmbeddingPoolerOutput):
-                    return output
-                else:
-                    assert isinstance(output, PPProxyTensors)
-                    # TODO(Yuwei): support PP Support
-                    raise NotImplementedError(
-                        "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
-                    )
+        # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+
+        # Determine if this batch has LoRA requests — skip CUDA graph
+        # replay so the compiled model runs directly with triton LoRA kernels.
+        # Note: prepare_lora_batch was already called during ForwardBatch.init_new(),
+        # so lora_backend.batch_info is already set for the current batch.
+        skip_cuda_graphs = False
+        if self.lora_backend is not None and forward_batch.lora_ids is not None:
+            skip_cuda_graphs = any(
+                lid is not None for lid in forward_batch.lora_ids
+            )
+
+        # Replay
+        with set_forward_context(
+            static_forward_batch,
+            self.attention_layers,
+            self.quant_config,
+            self.moe_layers,
+            self.moe_fusions,
+            lora_backend=self.lora_backend,
+            skip_cuda_graphs=skip_cuda_graphs,
+        ):
+            with set_compiled(True):
+                output = self.model_runner.model.forward(
+                    static_forward_batch.input_ids,
+                    static_forward_batch.positions,
+                    static_forward_batch,
+                    **kwargs,
+                )
+            if isinstance(output, LogitsProcessorOutput):
+                return LogitsProcessorOutput(
+                    next_token_logits=output.next_token_logits[
+                        : self.raw_num_tokens
+                    ],
+                    hidden_states=(
+                        output.hidden_states[: self.raw_num_tokens]
+                        if output.hidden_states is not None
+                        else None
+                    ),
+                )
+            elif isinstance(output, EmbeddingPoolerOutput):
+                return output
+            else:
+                assert isinstance(output, PPProxyTensors)
+                # TODO(Yuwei): support PP Support
+                raise NotImplementedError(
+                    "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
+                )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

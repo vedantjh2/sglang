@@ -12,6 +12,7 @@ import torch.fx as fx
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
     get_pcg_capture_stream,
     is_in_pcg_torch_compile,
 )
@@ -140,7 +141,15 @@ class CUDAPiecewiseBackend:
             if self.is_last_graph and not self.to_be_compiled_sizes:
                 self.check_for_ending_compilation()
 
+        # Skip CUDA graph replay when:
+        # - torch.compile warmup phase (is_in_pcg_torch_compile), or
+        # - LoRA is active (skip_cuda_graphs) — run the inductor-compiled
+        #   code directly so LoRA custom ops execute with real batch_info
+        #   instead of replaying captured no-ops.
         if is_in_pcg_torch_compile():
+            return entry.runnable(*args)
+        ctx = get_forward_context()
+        if ctx is not None and ctx.skip_cuda_graphs:
             return entry.runnable(*args)
 
         if entry.cudagraph is None:

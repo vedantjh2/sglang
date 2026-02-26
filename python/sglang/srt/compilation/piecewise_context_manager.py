@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 _in_piecewise_cuda_graph = False
 _in_pcg_torch_compile = False
 _pcg_capture_stream = None
+_in_capture_mode = False
 
 
 def is_in_piecewise_cuda_graph():
@@ -24,6 +25,20 @@ def is_in_pcg_torch_compile():
 
 def get_pcg_capture_stream():
     return _pcg_capture_stream
+
+
+def is_in_capture_mode() -> bool:
+    return _in_capture_mode
+
+
+@contextmanager
+def set_capture_mode():
+    global _in_capture_mode
+    _in_capture_mode = True
+    try:
+        yield
+    finally:
+        _in_capture_mode = False
 
 
 @contextmanager
@@ -58,8 +73,10 @@ class ForwardContext:
         self.forward_batch = None
         self.attention_layer = None
         self.quant_config = None
+        self.lora_backend = None
         self.moe_layers = None
         self.moe_fusions = None
+        self.skip_cuda_graphs = False
 
     def set_forward_batch(self, forward_batch: ForwardBatch):
         self.forward_batch = forward_batch
@@ -75,6 +92,9 @@ class ForwardContext:
 
     def set_moe_fusions(self, fusions: List[Any]):
         self.moe_fusions = fusions
+
+    def set_lora_backend(self, lora_backend: Any):
+        self.lora_backend = lora_backend
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -93,6 +113,8 @@ def set_forward_context(
     quant_config: Any,
     moe_layers: List[Any],
     moe_fusions: List[Any],
+    lora_backend: Any = None,
+    skip_cuda_graphs: bool = False,
 ):
     global _forward_context
     _forward_context = ForwardContext()
@@ -101,6 +123,9 @@ def set_forward_context(
     _forward_context.set_quant_config(quant_config)
     _forward_context.set_moe_layers(moe_layers)
     _forward_context.set_moe_fusions(moe_fusions)
+    if lora_backend is not None:
+        _forward_context.set_lora_backend(lora_backend)
+    _forward_context.skip_cuda_graphs = skip_cuda_graphs
     try:
         yield
     finally:

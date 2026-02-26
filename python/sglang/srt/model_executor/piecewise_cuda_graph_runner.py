@@ -271,6 +271,15 @@ class PiecewiseCudaGraphRunner:
         self.lora_backend = None
         if self.model_runner.server_args.enable_lora:
             self.lora_backend = self.model_runner.lora_manager.lora_backend
+            # Initialize static batch_info tensors for CUDA graph capture/replay.
+            # LoRA triton kernels will be captured INSIDE the CUDA graphs:
+            # they use these static tensors (by pointer), and we update the
+            # tensor data in-place before each replay.
+            max_num_tokens = max(self.capture_num_tokens)
+            self.model_runner.lora_manager.init_cuda_graph_batch_info(
+                max_bs_in_cuda_graph=1,
+                num_tokens_per_bs=max_num_tokens,
+            )
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -554,7 +563,23 @@ class PiecewiseCudaGraphRunner:
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
-            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+            # Set up static cuda_graph_batch_info for this capture size.
+            # The triton kernel grid uses batch_info.max_len and batch_info.bs
+            # (Python ints), which get baked into the CUDA graph at capture time.
+            # The tensor pointers (seg_lens, seg_indptr, weight_indices, etc.)
+            # are also captured; we update their DATA in-place before replay.
+            cg_bi = self.lora_backend.cuda_graph_batch_info
+            cg_bi.bs = 1
+            cg_bi.num_segments = 1
+            cg_bi.max_len = num_tokens
+            cg_bi.seg_lens[0] = num_tokens
+            cg_bi.seg_indptr[0] = 0
+            cg_bi.seg_indptr[1] = num_tokens
+            # weight_indices=0, lora_ranks=0, scalings=0 → kernels no-op (rank==0)
+            cg_bi.weight_indices.zero_()
+            cg_bi.lora_ranks.zero_()
+            cg_bi.scalings.zero_()
+            self.lora_backend.batch_info = cg_bi
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
@@ -747,15 +772,34 @@ class PiecewiseCudaGraphRunner:
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
 
-        # Determine if this batch has LoRA requests — skip CUDA graph
-        # replay so the compiled model runs directly with triton LoRA kernels.
-        # Note: prepare_lora_batch was already called during ForwardBatch.init_new(),
-        # so lora_backend.batch_info is already set for the current batch.
-        skip_cuda_graphs = False
-        if self.lora_backend is not None and forward_batch.lora_ids is not None:
-            skip_cuda_graphs = any(
-                lid is not None for lid in forward_batch.lora_ids
-            )
+        # Copy LoRA batch data into the static CUDA graph tensors so the
+        # replayed triton kernels see the correct weight_indices / ranks / scalings.
+        # prepare_lora_batch was already called during ForwardBatch.init_new()
+        # with use_cuda_graph=False, so lora_backend.batch_info has correct
+        # data in freshly-allocated tensors.  We copy that data into the
+        # pre-allocated static tensors whose pointers were captured in the graph.
+        #
+        # PCG always captures with bs=1, so the triton kernel grid's batch
+        # dimension is 1.  We consolidate multi-sequence batches into a single
+        # segment: seg_lens[0] = total_tokens, using the first request's
+        # adapter.  This is correct when all sequences use the same adapter
+        # (the common case for embedding workloads).  The kernel's
+        # `if rank == 0: return` guard handles non-LoRA batches.
+        if self.lora_backend is not None and self.lora_backend.cuda_graph_batch_info is not None:
+            src_bi = self.lora_backend.batch_info
+            cg_bi = self.lora_backend.cuda_graph_batch_info
+            num_tokens = len(forward_batch.input_ids)
+            # Single-segment view (bs=1) to match the captured kernel grid
+            cg_bi.bs = 1
+            cg_bi.num_segments = 1
+            cg_bi.seg_lens[0] = num_tokens
+            cg_bi.seg_indptr[0] = 0
+            cg_bi.seg_indptr[1] = num_tokens
+            # Use first request's adapter index (all requests assumed same adapter)
+            cg_bi.weight_indices[0] = src_bi.weight_indices[0]
+            cg_bi.lora_ranks.copy_(src_bi.lora_ranks, non_blocking=True)
+            cg_bi.scalings.copy_(src_bi.scalings, non_blocking=True)
+            self.lora_backend.batch_info = cg_bi
 
         # Replay
         with set_forward_context(
@@ -765,7 +809,6 @@ class PiecewiseCudaGraphRunner:
             self.moe_layers,
             self.moe_fusions,
             lora_backend=self.lora_backend,
-            skip_cuda_graphs=skip_cuda_graphs,
         ):
             with set_compiled(True):
                 output = self.model_runner.model.forward(

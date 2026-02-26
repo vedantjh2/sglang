@@ -76,7 +76,6 @@ class ForwardContext:
         self.lora_backend = None
         self.moe_layers = None
         self.moe_fusions = None
-        self.skip_cuda_graphs = False
 
     def set_forward_batch(self, forward_batch: ForwardBatch):
         self.forward_batch = forward_batch
@@ -114,7 +113,6 @@ def set_forward_context(
     moe_layers: List[Any],
     moe_fusions: List[Any],
     lora_backend: Any = None,
-    skip_cuda_graphs: bool = False,
 ):
     global _forward_context
     _forward_context = ForwardContext()
@@ -125,7 +123,6 @@ def set_forward_context(
     _forward_context.set_moe_fusions(moe_fusions)
     if lora_backend is not None:
         _forward_context.set_lora_backend(lora_backend)
-    _forward_context.skip_cuda_graphs = skip_cuda_graphs
     try:
         yield
     finally:

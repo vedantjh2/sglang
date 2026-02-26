@@ -20,17 +20,16 @@ is retrieved from the forward context at runtime.
 
 Unlike attention ops, LoRA ops are NOT registered as split ops. They remain
 inside the compiled CUDA graph pieces as opaque nodes. During CUDA graph
-capture, the ops skip execution via is_in_capture_mode() (output stays as-is),
-and during replay they execute with real batch_info from the forward context.
-This avoids fragmenting the CUDA graph into many small pieces, which would
-add kernel launch overhead and degrade performance.
+capture, the triton kernels are launched with all-zero lora_ranks so they
+no-op via the kernel-level `if rank == 0: return` guard. During replay,
+the static batch_info tensors (whose pointers were captured in the graph)
+are updated in-place with real LoRA metadata before each replay.
 """
 
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
-    is_in_capture_mode,
 )
 from sglang.srt.lora.triton_ops import (
     embedding_lora_a_fwd,
@@ -52,11 +51,6 @@ def _lora_a_sgemm(
     output: torch.Tensor,
     stack_num: int,
 ) -> None:
-    # During CUDA graph capture, skip triton kernels entirely.
-    # The output tensor stays as-is (zeros from caller), which is correct
-    # since captured graphs are for the base model without LoRA.
-    if is_in_capture_mode():
-        return
     context = get_forward_context()
     batch_info = context.lora_backend.batch_info
     ret = sgemm_lora_a_fwd(x, weights, batch_info, stack_num=stack_num)
@@ -89,8 +83,6 @@ def _lora_b_sgemm(
     weights: torch.Tensor,
     base_output: torch.Tensor,
 ) -> None:
-    if is_in_capture_mode():
-        return
     context = get_forward_context()
     batch_info = context.lora_backend.batch_info
     sgemm_lora_b_fwd(x, weights, batch_info, base_output)
@@ -124,8 +116,6 @@ def _qkv_lora(
     output_offset: torch.Tensor,
     max_qkv_out_dim: int,
 ) -> None:
-    if is_in_capture_mode():
-        return
     context = get_forward_context()
     batch_info = context.lora_backend.batch_info
     lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, batch_info, stack_num=3)
@@ -169,8 +159,6 @@ def _gate_up_lora(
     base_output: torch.Tensor,
     output_dim: int,
 ) -> None:
-    if is_in_capture_mode():
-        return
     context = get_forward_context()
     batch_info = context.lora_backend.batch_info
     lora_a_output = sgemm_lora_a_fwd(x, gate_up_lora_a, batch_info, stack_num=2)
@@ -213,8 +201,6 @@ def _embedding_lora_a(
     has_extra_embeddings: bool,
     extra_embeddings: torch.Tensor,
 ) -> None:
-    if is_in_capture_mode():
-        return
     context = get_forward_context()
     batch_info = context.lora_backend.batch_info
     extra_emb = extra_embeddings if has_extra_embeddings else None

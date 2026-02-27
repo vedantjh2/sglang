@@ -817,7 +817,7 @@ class PiecewiseCudaGraphRunner:
                 num_tokens = len(forward_batch.input_ids)
 
                 # Get adapter index from CPU-side data (stored by prepare_lora_batch)
-                adapter_idx = self.lora_backend.get_cpu_weight_index(0)
+                adapter_idx = self.lora_backend._cpu_weight_indices[0]
 
                 # Update static tensors using pre-allocated pinned buffers (async H2D)
                 self._pcg_seg_lens_buf[0] = num_tokens

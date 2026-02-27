@@ -12,7 +12,6 @@ import torch.fx as fx
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.piecewise_context_manager import (
-    get_forward_context,
     get_pcg_capture_stream,
     is_in_pcg_torch_compile,
 )

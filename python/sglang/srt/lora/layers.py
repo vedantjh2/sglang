@@ -27,6 +27,21 @@ from sglang.srt.lora.utils import LoRABatchInfo
 # Import to trigger custom op registration for PCG support
 import sglang.srt.lora.lora_custom_ops  # noqa: F401
 
+# Sentinel tensor reused when no extra embeddings exist, avoiding per-call allocation.
+_EMPTY_EXTRA_EMB_SENTINEL: Optional[torch.Tensor] = None
+
+
+def _get_empty_extra_emb_sentinel(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return a lazily-created (1,1,1) sentinel tensor, reused across calls."""
+    global _EMPTY_EXTRA_EMB_SENTINEL
+    if (
+        _EMPTY_EXTRA_EMB_SENTINEL is None
+        or _EMPTY_EXTRA_EMB_SENTINEL.device != device
+        or _EMPTY_EXTRA_EMB_SENTINEL.dtype != dtype
+    ):
+        _EMPTY_EXTRA_EMB_SENTINEL = torch.empty((1, 1, 1), device=device, dtype=dtype)
+    return _EMPTY_EXTRA_EMB_SENTINEL
+
 
 def _use_custom_ops() -> bool:
     """Check if we should use custom ops (PCG mode) instead of direct backend calls."""
@@ -118,11 +133,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
             extra_emb = (
                 self.new_embeddings_buffer
                 if has_extra
-                else torch.empty(
-                    (1, 1, 1),
-                    device=input_.device,
-                    dtype=self.embedding_A_buffer.dtype,
-                )
+                else _get_empty_extra_emb_sentinel(input_.device, self.embedding_A_buffer.dtype)
             )
             torch.ops.sglang.embedding_lora_a(
                 input_, self.embedding_A_buffer, lora_a_output,

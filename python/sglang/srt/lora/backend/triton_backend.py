@@ -217,3 +217,10 @@ class TritonLoRABackend(BaseLoRABackend):
         self._cpu_weight_indices = weight_indices
 
         self.batch_info = batch_info
+
+    def get_cpu_weight_index(self, idx: int) -> int:
+        """Return the CPU-side weight index for the given segment.
+
+        Used by the PCG runner to read the adapter index without a GPU sync.
+        """
+        return self._cpu_weight_indices[idx]

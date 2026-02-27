@@ -31,7 +31,6 @@ from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
-    set_capture_mode,
     set_forward_context,
     set_pcg_capture_stream,
 )
@@ -493,7 +492,7 @@ class PiecewiseCudaGraphRunner:
                             f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                         )
 
-                    with set_compiled(True), set_capture_mode():
+                    with set_compiled(True):
                         self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
@@ -794,83 +793,84 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+        with enable_piecewise_cuda_graph():
+            # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
 
-        # Copy LoRA batch data into the static CUDA graph tensors so the
-        # replayed triton kernels see the correct weight_indices / ranks / scalings.
-        # prepare_lora_batch was already called during ForwardBatch.init_new()
-        # with use_cuda_graph=False, so lora_backend.batch_info has correct
-        # data in freshly-allocated tensors (src_bi).
-        #
-        # The graph was captured with bs=1 (single segment). can_run()
-        # guarantees all requests use the same adapter. We just update:
-        #   - seg_lens[0] = total tokens in batch
-        #   - seg_indptr = [0, total_tokens]
-        #   - weight_indices[0] = adapter index
-        #   - lora_ranks, scalings (per-adapter data)
-        # All copies use pre-allocated pinned buffers → zero GPU sync.
-        if self.lora_backend is not None and self.lora_backend.cuda_graph_batch_info is not None:
-            src_bi = self.lora_backend.batch_info
-            cg_bi = self.lora_backend.cuda_graph_batch_info
-            num_tokens = len(forward_batch.input_ids)
+            # Copy LoRA batch data into the static CUDA graph tensors so the
+            # replayed triton kernels see the correct weight_indices / ranks / scalings.
+            # prepare_lora_batch was already called during ForwardBatch.init_new()
+            # with use_cuda_graph=False, so lora_backend.batch_info has correct
+            # data in freshly-allocated tensors (src_bi).
+            #
+            # The graph was captured with bs=1 (single segment). can_run()
+            # guarantees all requests use the same adapter. We just update:
+            #   - seg_lens[0] = total tokens in batch
+            #   - seg_indptr = [0, total_tokens]
+            #   - weight_indices[0] = adapter index
+            #   - lora_ranks, scalings (per-adapter data)
+            # All copies use pre-allocated pinned buffers → zero GPU sync.
+            if self.lora_backend is not None and self.lora_backend.cuda_graph_batch_info is not None:
+                src_bi = self.lora_backend.batch_info
+                cg_bi = self.lora_backend.cuda_graph_batch_info
+                num_tokens = len(forward_batch.input_ids)
 
-            # Get adapter index from CPU-side data (stored by prepare_lora_batch)
-            adapter_idx = self.lora_backend._cpu_weight_indices[0]
+                # Get adapter index from CPU-side data (stored by prepare_lora_batch)
+                adapter_idx = self.lora_backend.get_cpu_weight_index(0)
 
-            # Update static tensors using pre-allocated pinned buffers (async H2D)
-            self._pcg_seg_lens_buf[0] = num_tokens
-            cg_bi.seg_lens[:1].copy_(self._pcg_seg_lens_buf, non_blocking=True)
+                # Update static tensors using pre-allocated pinned buffers (async H2D)
+                self._pcg_seg_lens_buf[0] = num_tokens
+                cg_bi.seg_lens[:1].copy_(self._pcg_seg_lens_buf, non_blocking=True)
 
-            self._pcg_seg_indptr_buf[0] = 0
-            self._pcg_seg_indptr_buf[1] = num_tokens
-            cg_bi.seg_indptr[:2].copy_(self._pcg_seg_indptr_buf, non_blocking=True)
+                self._pcg_seg_indptr_buf[0] = 0
+                self._pcg_seg_indptr_buf[1] = num_tokens
+                cg_bi.seg_indptr[:2].copy_(self._pcg_seg_indptr_buf, non_blocking=True)
 
-            self._pcg_weight_idx_buf[0] = adapter_idx
-            cg_bi.weight_indices[:1].copy_(self._pcg_weight_idx_buf, non_blocking=True)
+                self._pcg_weight_idx_buf[0] = adapter_idx
+                cg_bi.weight_indices[:1].copy_(self._pcg_weight_idx_buf, non_blocking=True)
 
-            # Copy per-adapter ranks and scalings (GPU→GPU, async)
-            cg_bi.lora_ranks.copy_(src_bi.lora_ranks, non_blocking=True)
-            cg_bi.scalings.copy_(src_bi.scalings, non_blocking=True)
+                # Copy per-adapter ranks and scalings (GPU→GPU, async)
+                cg_bi.lora_ranks.copy_(src_bi.lora_ranks, non_blocking=True)
+                cg_bi.scalings.copy_(src_bi.scalings, non_blocking=True)
 
-            self.lora_backend.batch_info = cg_bi
+                self.lora_backend.batch_info = cg_bi
 
-        # Replay
-        with set_forward_context(
-            static_forward_batch,
-            self.attention_layers,
-            self.quant_config,
-            self.moe_layers,
-            self.moe_fusions,
-            lora_backend=self.lora_backend,
-        ):
-            with set_compiled(True):
-                output = self.model_runner.model.forward(
-                    static_forward_batch.input_ids,
-                    static_forward_batch.positions,
-                    static_forward_batch,
-                    **kwargs,
-                )
-            if isinstance(output, LogitsProcessorOutput):
-                return LogitsProcessorOutput(
-                    next_token_logits=output.next_token_logits[
-                        : self.raw_num_tokens
-                    ],
-                    hidden_states=(
-                        output.hidden_states[: self.raw_num_tokens]
-                        if output.hidden_states is not None
-                        else None
-                    ),
-                )
-            elif isinstance(output, EmbeddingPoolerOutput):
-                return output
-            else:
-                assert isinstance(output, PPProxyTensors)
-                # TODO(Yuwei): support PP Support
-                raise NotImplementedError(
-                    "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
-                )
+            # Replay
+            with set_forward_context(
+                static_forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+                lora_backend=self.lora_backend,
+            ):
+                with set_compiled(True):
+                    output = self.model_runner.model.forward(
+                        static_forward_batch.input_ids,
+                        static_forward_batch.positions,
+                        static_forward_batch,
+                        **kwargs,
+                    )
+                if isinstance(output, LogitsProcessorOutput):
+                    return LogitsProcessorOutput(
+                        next_token_logits=output.next_token_logits[
+                            : self.raw_num_tokens
+                        ],
+                        hidden_states=(
+                            output.hidden_states[: self.raw_num_tokens]
+                            if output.hidden_states is not None
+                            else None
+                        ),
+                    )
+                elif isinstance(output, EmbeddingPoolerOutput):
+                    return output
+                else:
+                    assert isinstance(output, PPProxyTensors)
+                    # TODO(Yuwei): support PP Support
+                    raise NotImplementedError(
+                        "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
+                    )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

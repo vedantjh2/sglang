@@ -190,13 +190,10 @@ class MambaPool:
         temporal: torch.Tensor
 
         def at_layer_idx(self, layer: int):
-            kwargs = {}
-            for k, v in vars(self).items():
-                if k == "conv" or k == "intermediate_conv_window":
-                    kwargs[k] = [conv[layer] for conv in v]
-                else:
-                    kwargs[k] = v[layer]
-            return type(self)(**kwargs)
+            return MambaPool.State(
+                conv=[conv[layer] for conv in self.conv],
+                temporal=self.temporal[layer],
+            )
 
         def mem_usage_bytes(self):
             return sum(
@@ -208,6 +205,16 @@ class MambaPool:
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
+
+        def at_layer_idx(self, layer: int):
+            return MambaPool.SpeculativeState(
+                conv=[conv[layer] for conv in self.conv],
+                temporal=self.temporal[layer],
+                intermediate_ssm=self.intermediate_ssm[layer],
+                intermediate_conv_window=[
+                    conv[layer] for conv in self.intermediate_conv_window
+                ],
+            )
 
     def __init__(
         self,

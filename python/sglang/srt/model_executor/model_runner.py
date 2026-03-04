@@ -2178,24 +2178,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_layers = []
         self.moe_fusions = []
         for layer in language_model.model.layers:
+            attn_layer = None
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
-                    self.attention_layers.append(layer.self_attn.attn)
+                    attn_layer = layer.self_attn.attn
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
-                    self.attention_layers.append(layer.self_attn.attn_mqa)
+                    attn_layer = layer.self_attn.attn_mqa
             # For hybrid model
             elif hasattr(layer, "attn"):
-                self.attention_layers.append(layer.attn)
+                attn_layer = layer.attn
             elif hasattr(layer, "linear_attn"):
                 if hasattr(layer.linear_attn, "attn"):
-                    self.attention_layers.append(layer.linear_attn.attn)
+                    attn_layer = layer.linear_attn.attn
                 else:
-                    self.attention_layers.append(layer.linear_attn)
+                    attn_layer = layer.linear_attn
             # For InternVL model
             elif hasattr(layer, "attention"):
                 if hasattr(layer.attention, "attn"):
-                    self.attention_layers.append(layer.attention.attn)
+                    attn_layer = layer.attention.attn
+            # For NemotronH and similar hybrid models using 'mixer' attribute
+            elif hasattr(layer, "mixer"):
+                if hasattr(layer.mixer, "attn"):
+                    attn_layer = layer.mixer.attn
+                elif hasattr(layer, "_forward_mamba"):
+                    # Mamba layer with split op support - store the layer itself
+                    attn_layer = layer
+            # attn_layer is None for non-attention layers (e.g. Mamba, MLP-only)
+            self.attention_layers.append(attn_layer)
 
             moe_block = None
             moe_fusion = None
@@ -2213,11 +2223,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
 
-        if len(self.attention_layers) < self.model_config.num_hidden_layers:
-            # TODO(yuwei): support Non-Standard GQA
+        num_attn_layers_found = sum(
+            1 for layer in self.attention_layers if layer is not None
+        )
+        if num_attn_layers_found == 0:
             log_info_on_rank0(
                 logger,
-                "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
+                "Disable piecewise CUDA graph because no attention layers were found",
             )
             return
 

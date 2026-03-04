@@ -21,6 +21,8 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
@@ -63,6 +65,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
@@ -391,6 +394,21 @@ class NemotronHMambaDecoderLayer(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
+    def _forward_mamba(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Core Mamba forward logic, called directly or via split op."""
+        output = torch.empty_like(hidden_states)
+        attn_backend = forward_batch.attn_backend
+        assert isinstance(attn_backend, HybridLinearAttnBackend)
+        assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
+        attn_backend.linear_attn_backend.forward(
+            mixer=self.mixer,
+            layer_id=self.layer_id,
+            hidden_states=hidden_states,
+            output=output,
+            use_triton_causal_conv=True,
+        )
+        return output
+
     def forward(
         self,
         *,
@@ -404,18 +422,13 @@ class NemotronHMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        output = torch.empty_like(hidden_states)
-        attn_backend = forward_batch.attn_backend
-        assert isinstance(attn_backend, HybridLinearAttnBackend)
-        assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
-        attn_backend.linear_attn_backend.forward(
-            mixer=self.mixer,
-            layer_id=self.layer_id,
-            hidden_states=hidden_states,
-            output=output,
-            use_triton_causal_conv=True,  # TODO: investigate need of `use_triton_causal_conv`
-        )
-        return output, residual
+        if get_forward_context() is not None:
+            output = torch.empty_like(hidden_states)
+            nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+            return output, residual
+        else:
+            output = self._forward_mamba(hidden_states, forward_batch)
+            return output, residual
 
 
 class NemotronHAttention(nn.Module):
@@ -526,12 +539,12 @@ class NemotronHAttentionDecoderLayer(nn.Module):
 
 
 Layers = (
-    NemotronHAttentionDecoderLayer
-    | NemotronHMLPDecoderLayer
-    | NemotronHMambaDecoderLayer
-    | NemotronHMoEDecoderLayer
+    NemotronHAttentionDecoderLayer,
+    NemotronHMLPDecoderLayer,
+    NemotronHMambaDecoderLayer,
+    NemotronHMoEDecoderLayer,
 )
-ALL_DECODER_LAYER_TYPES: dict[str, type[Layers]] = {
+ALL_DECODER_LAYER_TYPES: dict[str, type] = {
     ATTENTION: NemotronHAttentionDecoderLayer,
     MLP: NemotronHMLPDecoderLayer,
     MAMBA: NemotronHMambaDecoderLayer,
@@ -861,3 +874,35 @@ class NemotronHForCausalLM(nn.Module):
 
 
 EntryClass = [NemotronHForCausalLM]
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def nemotron_mamba2_with_output(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """Split op for Mamba2 forward in piecewise CUDA graph mode."""
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    mamba_layer = attention_layers[layer_id]
+
+    # In piecewise CUDA graph mode, hidden_states may be padded to the
+    # captured graph size. Slice to actual token count for Mamba forward.
+    attn_backend = forward_batch.attn_backend
+    metadata = attn_backend.linear_attn_backend.forward_metadata
+    num_actual_tokens = metadata.num_prefill_tokens + (
+        metadata.num_decodes * metadata.draft_token_num
+        if metadata.is_target_verify
+        else metadata.num_decodes
+    )
+    if hidden_states.shape[0] != num_actual_tokens:
+        hidden_states = hidden_states[:num_actual_tokens]
+
+    ret = mamba_layer._forward_mamba(hidden_states, forward_batch)
+
+    # Copy result back; output may be larger (padded) so only fill actual tokens
+    output[:num_actual_tokens].view(ret.shape).copy_(ret)
+    return

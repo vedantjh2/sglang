@@ -65,13 +65,13 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
     make_layers,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
@@ -394,7 +394,9 @@ class NemotronHMambaDecoderLayer(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-    def _forward_mamba(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+    def _forward_mamba(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
         """Core Mamba forward logic, called directly or via split op."""
         output = torch.empty_like(hidden_states)
         attn_backend = forward_batch.attn_backend

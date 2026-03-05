@@ -196,7 +196,6 @@ class MambaPool:
                     kwargs[k] = [conv[layer] for conv in v]
                 else:
                     kwargs[k] = v[layer]
-
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):

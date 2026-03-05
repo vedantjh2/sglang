@@ -28,7 +28,7 @@ import abc
 import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
@@ -190,10 +190,17 @@ class MambaPool:
         temporal: torch.Tensor
 
         def at_layer_idx(self, layer: int):
-            return MambaPool.State(
-                conv=[conv[layer] for conv in self.conv],
-                temporal=self.temporal[layer],
-            )
+            kwargs = {}
+            # Use fields instead of vars to avoid torch.compile graph break
+            for f in fields(self):
+                name = f.name
+                v = getattr(self, name)
+                if name in ("conv", "intermediate_conv_window"):
+                    kwargs[name] = [conv[layer] for conv in v]
+                else:
+                    kwargs[name] = v[layer]
+
+            return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
             return sum(
@@ -205,16 +212,6 @@ class MambaPool:
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
-
-        def at_layer_idx(self, layer: int):
-            return MambaPool.SpeculativeState(
-                conv=[conv[layer] for conv in self.conv],
-                temporal=self.temporal[layer],
-                intermediate_ssm=self.intermediate_ssm[layer],
-                intermediate_conv_window=[
-                    conv[layer] for conv in self.intermediate_conv_window
-                ],
-            )
 
     def __init__(
         self,

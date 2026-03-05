@@ -2241,6 +2241,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.moe_fusions.append(moe_fusion)
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
+            # TODO(yuwei): support Non-Standard GQA
             log_info_on_rank0(
                 logger,
                 "Disable piecewise CUDA graph because some layers do not apply Standard GQA",

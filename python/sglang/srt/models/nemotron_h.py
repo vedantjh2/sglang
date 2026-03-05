@@ -22,7 +22,10 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
@@ -424,7 +427,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+        if is_in_piecewise_cuda_graph():
             output = torch.empty_like(hidden_states)
             nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
             return output, residual

@@ -422,7 +422,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        if get_forward_context() is not None:
+        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             output = torch.empty_like(hidden_states)
             nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
             return output, residual

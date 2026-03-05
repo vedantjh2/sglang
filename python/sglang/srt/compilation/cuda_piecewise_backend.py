@@ -140,7 +140,6 @@ class CUDAPiecewiseBackend:
             if self.is_last_graph and not self.to_be_compiled_sizes:
                 self.check_for_ending_compilation()
 
-        # Skip CUDA graph replay during torch.compile warmup phase.
         if is_in_pcg_torch_compile():
             return entry.runnable(*args)
 

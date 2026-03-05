@@ -268,32 +268,43 @@ class PiecewiseCudaGraphRunner:
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
 
-        # Get lora_backend if LoRA is enabled, for passing into forward context
+        # Get lora_backend if LoRA is enabled, for passing into forward context.
+        # PCG LoRA only supports the triton backend because the custom ops
+        # (lora_custom_ops.py) wrap triton kernel launchers directly and
+        # replay relies on TritonLoRABackend._cpu_weight_indices.
         self.lora_backend = None
         if self.model_runner.server_args.enable_lora:
-            self.lora_backend = self.model_runner.lora_manager.lora_backend
-            # Initialize static batch_info tensors for CUDA graph capture/replay.
-            # LoRA triton kernels will be captured INSIDE the CUDA graphs:
-            # they use these static tensors (by pointer), and we update the
-            # tensor data in-place before each replay.
-            #
-            # The triton kernel grid's batch dimension (`bs`) is baked into the
-            # CUDA graph at capture time. We capture with bs=1 for optimal
-            # kernel performance (zero overhead from no-op blocks). During
-            # replay, all tokens are treated as a single segment with one
-            # adapter. Batches with mixed adapters are rejected by can_run()
-            # and fall back to the non-graph forward path.
-            self.pcg_lora_bs = 1
-            max_num_tokens = max(self.capture_num_tokens)
-            self.model_runner.lora_manager.init_cuda_graph_batch_info(
-                max_bs_in_cuda_graph=self.pcg_lora_bs,
-                num_tokens_per_bs=max_num_tokens,
-            )
-            # Pre-allocate pinned CPU buffers for async H2D transfers in replay.
-            # This avoids per-replay pinned memory allocation overhead.
-            self._pcg_seg_lens_buf = torch.zeros(1, dtype=torch.int32).pin_memory()
-            self._pcg_seg_indptr_buf = torch.zeros(2, dtype=torch.int32).pin_memory()
-            self._pcg_weight_idx_buf = torch.zeros(1, dtype=torch.int32).pin_memory()
+            if self.model_runner.server_args.lora_backend != "triton":
+                logger.warning(
+                    "Piecewise CUDA graph for LoRA is only supported with "
+                    "--lora-backend triton. Disabling PCG LoRA for backend "
+                    f"'{self.model_runner.server_args.lora_backend}'. "
+                    "LoRA will use the non-graph forward path."
+                )
+            else:
+                self.lora_backend = self.model_runner.lora_manager.lora_backend
+                # Initialize static batch_info tensors for CUDA graph capture/replay.
+                # LoRA triton kernels will be captured INSIDE the CUDA graphs:
+                # they use these static tensors (by pointer), and we update the
+                # tensor data in-place before each replay.
+                #
+                # The triton kernel grid's batch dimension (`bs`) is baked into the
+                # CUDA graph at capture time. We capture with bs=1 for optimal
+                # kernel performance (zero overhead from no-op blocks). During
+                # replay, all tokens are treated as a single segment with one
+                # adapter. Batches with mixed adapters are rejected by can_run()
+                # and fall back to the non-graph forward path.
+                self.pcg_lora_bs = 1
+                max_num_tokens = max(self.capture_num_tokens)
+                self.model_runner.lora_manager.init_cuda_graph_batch_info(
+                    max_bs_in_cuda_graph=self.pcg_lora_bs,
+                    num_tokens_per_bs=max_num_tokens,
+                )
+                # Pre-allocate pinned CPU buffers for async H2D transfers in replay.
+                # This avoids per-replay pinned memory allocation overhead.
+                self._pcg_seg_lens_buf = torch.zeros(1, dtype=torch.int32).pin_memory()
+                self._pcg_seg_indptr_buf = torch.zeros(2, dtype=torch.int32).pin_memory()
+                self._pcg_weight_idx_buf = torch.zeros(1, dtype=torch.int32).pin_memory()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())

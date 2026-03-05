@@ -2223,13 +2223,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
 
-        num_attn_layers_found = sum(
-            1 for layer in self.attention_layers if layer is not None
-        )
-        if num_attn_layers_found == 0:
+        if len(self.attention_layers) < self.model_config.num_hidden_layers:
             log_info_on_rank0(
                 logger,
-                "Disable piecewise CUDA graph because no attention layers were found",
+                "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
             )
             return
 

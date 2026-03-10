@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
@@ -160,9 +162,12 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
     def init_cuda_graph_batch_info(
         self,
+        cuda_graph_batch_info: LoRABatchInfo,
         max_bs_in_cuda_graph: int,
-        num_tokens_per_bs: int,
     ):
+        # CSGMV needs different buffer sizes than the manager-created batch_info,
+        # so we create our own internal cuda_graph_batch_info.
+        num_tokens_per_bs = cuda_graph_batch_info.max_len or 1
         max_num_segments = (
             (num_tokens_per_bs + MIN_CHUNK_SIZE - 1) // MIN_CHUNK_SIZE
         ) * max_bs_in_cuda_graph
@@ -187,7 +192,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
-        use_cuda_graph: bool,
+        batch_info: Optional[LoRABatchInfo] = None,
     ):
         chunk_size = self._determine_chunk_size(forward_batch)
 
@@ -209,7 +214,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             scalings, dtype=torch.float, pin_memory=True, device="cpu"
         )
 
-        if not use_cuda_graph:
+        if batch_info is None:
             batch_info = LoRABatchInfo(
                 bs=forward_batch.batch_size,
                 num_segments=num_segments,
@@ -234,6 +239,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 seg_lens=None,
             )
         else:
+            # CSGMV uses its own internal cuda_graph_batch_info with different buffer sizes
             batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = num_segments

@@ -523,7 +523,7 @@ class CudaGraphRunner:
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
-                num_tokens_per_bs=self.num_tokens_per_bs,
+                max_len=self.num_tokens_per_bs,
             )
 
         enable_mamba_track = (

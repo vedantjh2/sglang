@@ -1,7 +1,8 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -142,8 +143,8 @@ class BaseLoRABackend:
 
     def init_cuda_graph_batch_info(
         self,
+        cuda_graph_batch_info: LoRABatchInfo,
         max_bs_in_cuda_graph: int,
-        num_tokens_per_bs: int,
     ):
         """Initialize the batch info for CUDA Graph mode.
 
@@ -153,7 +154,6 @@ class BaseLoRABackend:
         Args:
             cuda_graph_batch_info: the LoRABatchInfo object created in LoraManager
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
-            num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
         """
         pass
 
@@ -163,7 +163,7 @@ class BaseLoRABackend:
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
-        use_cuda_graph: bool,
+        batch_info: Optional[LoRABatchInfo] = None,
     ):
         """Prepare the lora weights and batch info for current forward batch.
 
@@ -175,6 +175,7 @@ class BaseLoRABackend:
             weight_indices: list of indices of lora weights to be applied for current batch
             lora_ranks: list of lora ranks corresponding to weight_indices
             scalings: list of scaling factors corresponding to weight_indices
-            use_cuda_graph: whether to use CUDA Graph for this batch
+            batch_info: optional LoRABatchInfo object, if provided uses pre-allocated
+                        CUDA graph buffers for in-place updates
         """
         pass

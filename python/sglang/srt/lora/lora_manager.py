@@ -34,6 +34,7 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
+    LoRABatchInfo,
     LoRAType,
     get_normalized_target_modules,
     get_target_module_name,
@@ -96,12 +97,28 @@ class LoRAManager:
         )
 
     def init_cuda_graph_batch_info(
-        self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
+        self, max_bs_in_cuda_graph: int, max_len: int = 1
     ):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+        with torch.device("cuda"):
+            self.cuda_graph_batch_info = LoRABatchInfo(
+                bs=max_bs_in_cuda_graph,
+                use_cuda_graph=True,
+                num_segments=None,
+                seg_lens=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
+                # max_len determines triton kernel grid size (baked into CUDA graph).
+                # DECODE: 1 (default). PCG/EXTEND: max_num_tokens so grids cover all tokens.
+                max_len=max_len,
+                weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                permutation=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+            )
+
         self.lora_backend.init_cuda_graph_batch_info(
+            cuda_graph_batch_info=self.cuda_graph_batch_info,
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
-            num_tokens_per_bs=num_tokens_per_bs,
         )
 
     def create_lora_update_result(
@@ -262,15 +279,21 @@ class LoRAManager:
             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    def prepare_lora_batch(
+        self, forward_batch: ForwardBatch, use_cuda_graph: Optional[bool] = None
+    ):
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
-        use_cuda_graph = (
-            hasattr(self, "max_bs_in_cuda_graph")
-            and bs <= self.max_bs_in_cuda_graph
-            and forward_batch.forward_mode.is_cuda_graph()
-        )
+        # PCG uses EXTEND mode (not CUDA_GRAPH), so is_cuda_graph() returns False.
+        # The explicit use_cuda_graph param lets PCG force pre-allocated batch_info
+        # usage, keeping tensor addresses stable for CUDA graph replay.
+        if use_cuda_graph is None:
+            use_cuda_graph = (
+                hasattr(self, "max_bs_in_cuda_graph")
+                and bs <= self.max_bs_in_cuda_graph
+                and forward_batch.forward_mode.is_cuda_graph()
+            )
 
         weight_indices = [0] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
@@ -288,7 +311,7 @@ class LoRAManager:
             weight_indices=weight_indices,
             lora_ranks=lora_ranks,
             scalings=scalings,
-            use_cuda_graph=use_cuda_graph,
+            batch_info=self.cuda_graph_batch_info if use_cuda_graph else None,
         )
 
     def update_lora_info(self):

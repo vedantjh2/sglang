@@ -2263,8 +2263,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 elif hasattr(layer, "_forward_mamba"):
                     # Mamba layer with split op support - store the layer itself
                     attn_layer = layer
-            # attn_layer is None for non-attention layers (e.g. Mamba, MLP-only)
-            self.attention_layers.append(attn_layer)
+
+            if attn_layer is not None:
+                self.attention_layers.append(attn_layer)
 
             moe_block = None
             moe_fusion = None

@@ -262,15 +262,21 @@ class LoRAManager:
             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    def prepare_lora_batch(
+        self, forward_batch: ForwardBatch, use_cuda_graph: Optional[bool] = None
+    ):
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
-        use_cuda_graph = (
-            hasattr(self, "max_bs_in_cuda_graph")
-            and bs <= self.max_bs_in_cuda_graph
-            and forward_batch.forward_mode.is_cuda_graph()
-        )
+        # PCG uses EXTEND mode (not CUDA_GRAPH), so is_cuda_graph() returns False.
+        # The explicit use_cuda_graph param lets PCG force pre-allocated batch_info
+        # usage, keeping tensor addresses stable for CUDA graph replay.
+        if use_cuda_graph is None:
+            use_cuda_graph = (
+                hasattr(self, "max_bs_in_cuda_graph")
+                and bs <= self.max_bs_in_cuda_graph
+                and forward_batch.forward_mode.is_cuda_graph()
+            )
 
         weight_indices = [0] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch

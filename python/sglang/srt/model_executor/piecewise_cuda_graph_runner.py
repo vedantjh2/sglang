@@ -267,6 +267,17 @@ class PiecewiseCudaGraphRunner:
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
+        self.lora_backend = (
+            self.model_runner.lora_manager.lora_backend
+            if self.model_runner.server_args.enable_lora
+            else None
+        )
+
+        # Pre-allocate LoRA batch info for stable tensor addresses across CUDA graph captures
+        if self.lora_backend is not None:
+            self.model_runner.lora_manager.init_cuda_graph_batch_info(
+                self.max_num_tokens, num_tokens_per_bs=self.max_num_tokens
+            )
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -385,7 +396,7 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                lora_ids=[None] * 1 if self.lora_backend is not None else None,
             )
 
         # Attention backend
@@ -393,12 +404,18 @@ class PiecewiseCudaGraphRunner:
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
+
+        # Prepare LoRA batch info for warmup so LoRA layers can execute
+        if self.lora_backend is not None:
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+
         with set_forward_context(
             forward_batch,
             self.attention_layers,
             self.quant_config,
             self.moe_layers,
             self.moe_fusions,
+            self.lora_backend,
         ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -542,12 +559,14 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                lora_ids=lora_ids,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
-            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+            self.model_runner.lora_manager.prepare_lora_batch(
+                forward_batch, use_cuda_graph=True
+            )
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
@@ -571,6 +590,7 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                self.lora_backend,
             ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -740,6 +760,14 @@ class PiecewiseCudaGraphRunner:
             # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+
+            # Re-prepare LoRA batch with pre-allocated cuda_graph_batch_info so tensor
+            # addresses match what was captured in the CUDA graph.
+            if self.lora_backend is not None:
+                self.model_runner.lora_manager.prepare_lora_batch(
+                    forward_batch, use_cuda_graph=True
+                )
+
             # Replay
             with set_forward_context(
                 static_forward_batch,
@@ -747,6 +775,7 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                self.lora_backend,
             ):
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,

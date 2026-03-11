@@ -9,7 +9,7 @@ from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"]))
-@triton.jit(do_not_specialize=["num_segs"])
+@triton.jit
 def _chunked_lora_expand_kernel(
     # Pointers to matrices
     x,
@@ -20,7 +20,7 @@ def _chunked_lora_expand_kernel(
     weight_indices,
     lora_ranks,
     permutation,
-    num_segs,
+    num_segs,  # pointer to 1-element tensor holding number of segments
     # For fused output scaling
     scalings,
     # Offsets of q/k/v slice on output dimension
@@ -62,7 +62,7 @@ def _chunked_lora_expand_kernel(
     output_stride_1: tl.constexpr = 1
 
     pid_s = tl.program_id(axis=2)
-    if pid_s >= num_segs:
+    if pid_s >= tl.load(num_segs):
         return
 
     # Current block computes sequence with batch_id,
@@ -199,7 +199,7 @@ def chunked_sgmv_lora_expand_forward(
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
         permutation=batch_info.permutation,
-        num_segs=num_segments,
+        num_segs=batch_info.num_segments_tensor,
         scalings=batch_info.scalings,
         slice_offsets=slice_offsets,
         # constants

@@ -146,7 +146,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             return MIN_CHUNK_SIZE
 
         num_tokens = (
-            forward_batch.extend_num_tokens
+            (forward_batch.extend_num_tokens or forward_batch.batch_size)
             if forward_batch.forward_mode.is_extend()
             else forward_batch.batch_size
         )
@@ -163,22 +163,29 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         max_bs_in_cuda_graph: int,
         num_tokens_per_bs: int,
     ):
-        max_num_segments = (
-            (num_tokens_per_bs + MIN_CHUNK_SIZE - 1) // MIN_CHUNK_SIZE
-        ) * max_bs_in_cuda_graph
-        max_num_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
+        # For csgmv, max_len becomes BLOCK_M (tl.constexpr) in the triton kernel,
+        # controlling the tile size for processing tokens within a segment.
+        # It must be max_chunk_size (not max_num_tokens) to keep kernel tiles small.
+        #
+        # The grid uses batch_info.bs as the segment dimension, baked into CUDA graph.
+        # Compute the tightest upper bound on segments for the configured chunk size.
+        max_segments = (
+            (max_bs_in_cuda_graph + self.max_chunk_size - 1) // self.max_chunk_size
+            + self.max_loras_per_batch
+        )
         with torch.device("cuda"):
             self.cuda_graph_batch_info = LoRABatchInfo(
-                bs=max_bs_in_cuda_graph,
+                bs=max_segments,
                 use_cuda_graph=True,
-                seg_lens=torch.zeros(max_num_segments, dtype=torch.int32),
-                seg_indptr=torch.zeros(max_num_segments + 1, dtype=torch.int32),
-                weight_indices=torch.zeros(max_num_segments, dtype=torch.int32),
-                permutation=torch.zeros(max_num_tokens, dtype=torch.int32),
+                seg_lens=torch.zeros(max_segments, dtype=torch.int32),
+                seg_indptr=torch.zeros(max_segments + 1, dtype=torch.int32),
+                weight_indices=torch.zeros(max_segments, dtype=torch.int32),
+                permutation=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
                 num_segments=None,  # Set per batch
-                max_len=None,  # Not used in CSGMV backend
+                max_len=self.max_chunk_size,
+                num_segments_tensor=torch.zeros(1, dtype=torch.int32),
             )
 
     def prepare_lora_batch(
@@ -232,12 +239,18 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 ),
                 # Not used in chunked kernels
                 seg_lens=None,
+                num_segments_tensor=torch.tensor(
+                    [num_segments], dtype=torch.int32, device=self.device
+                ),
             )
         else:
             batch_info = self.cuda_graph_batch_info
-            batch_info.bs = forward_batch.batch_size
+            # Do NOT update batch_info.bs or batch_info.max_len: they control
+            # kernel grid size / BLOCK_M and are baked into the CUDA graph.
             batch_info.num_segments = num_segments
-            batch_info.max_len = chunk_size
+            # Update the device tensor so the kernel reads the live value
+            # (scalar kernel args are baked into CUDA graphs and can't change).
+            batch_info.num_segments_tensor.fill_(num_segments)
 
         # Copy to device asynchronously
         batch_info.lora_ranks[: self.max_loras_per_batch].copy_(

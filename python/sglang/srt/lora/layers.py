@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     split_tensor_along_last_dim,
@@ -22,6 +23,72 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.utils.custom_op import register_custom_op
+
+
+# ── Custom ops for piecewise CUDA graph compatibility ───────────────
+# Following the pattern from radix_attention.py: during torch.compile,
+# the lora_backend is retrieved from the ForwardContext instead of being
+# accessed as a Python attribute, which dynamo cannot trace.
+
+
+@register_custom_op(mutates_args=["base_output"])
+def _lora_shrink_and_expand(
+    x: torch.Tensor,
+    A_buffer: torch.Tensor,
+    B_buffer: torch.Tensor,
+    output_offset: torch.Tensor,
+    base_output: torch.Tensor,
+) -> None:
+    context = get_forward_context()
+    lora_backend = context.lora_backend
+    lora_a_output = lora_backend.run_lora_a_sgemm(x, A_buffer)
+    lora_backend.run_lora_b_sgemm(
+        x=lora_a_output,
+        weights=B_buffer,
+        output_offset=output_offset,
+        base_output=base_output,
+    )
+
+
+@register_custom_op(mutates_args=["base_output"])
+def _lora_qkv(
+    x: torch.Tensor,
+    qkv_lora_a: torch.Tensor,
+    qkv_lora_b: torch.Tensor,
+    output_offset: torch.Tensor,
+    base_output: torch.Tensor,
+    max_qkv_out_dim: int,
+) -> None:
+    context = get_forward_context()
+    lora_backend = context.lora_backend
+    lora_backend.run_qkv_lora(
+        x=x,
+        qkv_lora_a=qkv_lora_a,
+        qkv_lora_b=qkv_lora_b,
+        base_output=base_output,
+        output_offset=output_offset,
+        max_qkv_out_dim=max_qkv_out_dim,
+    )
+
+
+@register_custom_op(mutates_args=["base_output"])
+def _lora_gate_up(
+    x: torch.Tensor,
+    gate_up_lora_a: torch.Tensor,
+    gate_up_lora_b: torch.Tensor,
+    output_offset: torch.Tensor,
+    base_output: torch.Tensor,
+) -> None:
+    context = get_forward_context()
+    lora_backend = context.lora_backend
+    lora_backend.run_gate_up_lora(
+        x=x,
+        gate_up_lora_a=gate_up_lora_a,
+        gate_up_lora_b=gate_up_lora_b,
+        output_offset=output_offset,
+        base_output=base_output,
+    )
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -325,6 +392,11 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if get_forward_context() is not None:
+            _lora_shrink_and_expand(
+                x, self.A_buffer, self.B_buffer, self.output_offset, base_output
+            )
+            return base_output
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
@@ -391,6 +463,12 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if get_forward_context() is not None:
+            _lora_gate_up(
+                x, self.A_buffer_gate_up, self.B_buffer_gate_up,
+                self.output_offset, base_output
+            )
+            return base_output
         lora_output = self.lora_backend.run_gate_up_lora(
             x=x,
             gate_up_lora_a=self.A_buffer_gate_up,
@@ -452,6 +530,12 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.B_buffer_qkv = B_buffer_qkv
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if get_forward_context() is not None:
+            _lora_qkv(
+                x, self.A_buffer_qkv, self.B_buffer_qkv,
+                self.output_offset, base_output, self.max_qkv_out_dim
+            )
+            return base_output
         lora_output = self.lora_backend.run_qkv_lora(
             x=x,
             qkv_lora_a=self.A_buffer_qkv,
@@ -518,6 +602,11 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if get_forward_context() is not None:
+            _lora_shrink_and_expand(
+                x, self.A_buffer, self.B_buffer, self.output_offset, base_output
+            )
+            return base_output
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,

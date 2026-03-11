@@ -140,7 +140,7 @@ class CUDAPiecewiseBackend:
             if self.is_last_graph and not self.to_be_compiled_sizes:
                 self.check_for_ending_compilation()
 
-        if is_in_pcg_torch_compile():
+        if is_in_pcg_torch_compile() or self.compile_config.compile_only:
             return entry.runnable(*args)
 
         if entry.cudagraph is None:

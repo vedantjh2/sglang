@@ -176,6 +176,7 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
             self.model_runner.server_args.enable_torch_compile_debug_mode,
+            compile_only=self.model_runner.server_args.piecewise_cuda_graph_compile_only,
         )
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             self.compile_config.add_split_op(
@@ -274,7 +275,8 @@ class PiecewiseCudaGraphRunner:
         )
 
         # Pre-allocate LoRA batch info for stable tensor addresses across CUDA graph captures
-        if self.lora_backend is not None:
+        # (not needed in compile-only mode since there are no captured graphs)
+        if self.lora_backend is not None and not self.compile_config.compile_only:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(
                 self.max_num_tokens, num_tokens_per_bs=self.max_num_tokens
             )
@@ -321,8 +323,9 @@ class PiecewiseCudaGraphRunner:
 
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
-                # Capture
-                self.capture()
+                # Capture (skip in compile-only mode)
+                if not self.compile_config.compile_only:
+                    self.capture()
 
         self.raw_num_tokens = 0
 
@@ -751,11 +754,42 @@ class PiecewiseCudaGraphRunner:
 
         return static_forward_batch
 
+    def _forward_compile_only(
+        self,
+        forward_batch: ForwardBatch,
+        **kwargs,
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        """Forward using torch.compile-optimized kernels without CUDA graph replay.
+
+        Uses the compiled trampoline (via enable_piecewise_cuda_graph context)
+        but passes the original forward_batch directly — no static buffers,
+        no padding, no CUDA graph constraints.
+        """
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+        with enable_piecewise_cuda_graph():
+            with set_forward_context(
+                forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+                self.lora_backend,
+            ):
+                return self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
+
     def replay(
         self,
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        if self.compile_config.compile_only:
+            return self._forward_compile_only(forward_batch, **kwargs)
         with enable_piecewise_cuda_graph():
             # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)

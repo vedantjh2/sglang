@@ -626,6 +626,7 @@ class ServerArgs:
     piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
+    piecewise_cuda_graph_compile_only: bool = False
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -1024,6 +1025,12 @@ class ServerArgs:
                 self.piecewise_cuda_graph_compiler = "eager"
 
     def _handle_piecewise_cuda_graph(self):
+        # compile-only mode implies inductor compiler and forces PCG enabled
+        if self.piecewise_cuda_graph_compile_only:
+            if self.piecewise_cuda_graph_compiler == "eager":
+                self.piecewise_cuda_graph_compiler = "inductor"
+            self.enforce_piecewise_cuda_graph = True
+
         # Skip auto-disable when enforce flag is set (for testing)
         if self.enforce_piecewise_cuda_graph:
             self.disable_piecewise_cuda_graph = False
@@ -5087,6 +5094,13 @@ class ServerArgs:
             default=ServerArgs.piecewise_cuda_graph_compiler,
             help="Set the compiler for piecewise cuda graph. Choices are: eager, inductor.",
             choices=["eager", "inductor"],
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-compile-only",
+            action="store_true",
+            default=ServerArgs.piecewise_cuda_graph_compile_only,
+            help="Use torch.compile kernel fusion without CUDA graph capture/replay. "
+            "Provides compilation benefits without static buffer constraints.",
         )
         parser.add_argument(
             "--torch-compile-max-bs",

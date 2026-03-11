@@ -21,11 +21,13 @@ class CompilationConfig:
         capture_sizes: List[int],
         compiler: str = "eager",
         enable_debug_mode: bool = False,
+        compile_only: bool = False,
     ):
         self.traced_files = set()
         self.capture_sizes = capture_sizes
         self.compiler = compiler
         self.enable_debug_mode = enable_debug_mode
+        self.compile_only = compile_only
         self.split_ops = []
         self.split_ops.extend(SPLIT_OPS)
 

@@ -91,37 +91,27 @@ class OpenAIBeamSearchMixin:
         all_results: List[Any],
         request: ChatCompletionRequest,
     ) -> AsyncGenerator[str, None]:
-        """Generate streaming response for beam search results."""
+        """Generate streaming response for beam search results.
+
+        all_results is a list of packed dicts, each with meta_info.beam_results.
+        Each element corresponds to one request (single or one item in a batch).
+        """
         created = int(time.time())
         request_id = None
-
-        # all_results is a flat list where each element is a beam result dict
-        # Every n beams belong to the same request (first beam has complete meta_info with id)
-        rid_to_beam_results = {}
-        cur_rid = None
-        for result in all_results:
-            meta_info = result.get("meta_info", {})
-            rid = meta_info.get("id", "")
-            if rid:
-                rid_to_beam_results[rid] = [result]
-                cur_rid = rid
-            else:
-                assert cur_rid is not None
-                rid_to_beam_results[cur_rid].append(result)
-
-        if not rid_to_beam_results:
-            logger.warning("No valid beam search results found in all_results")
-            yield "data: [DONE]\n\n"
-            return
 
         all_choices = []
         request_meta_list = []
         choice_index = 0
-        for rid, beam_results in rid_to_beam_results.items():
+        sorted_results = sorted(all_results, key=lambda x: x.get("index", 0))
+        for packed in sorted_results:
+            beam_results = packed.get("meta_info", {}).get("beam_results")
+            if not beam_results:
+                continue
+            rid = packed["meta_info"].get("id", "")
             if not request_id:
                 request_id = rid
 
-            request_meta_list.append(beam_results[0])
+            request_meta_list.append(packed)
             choices = self._process_chat_beam_search_results(
                 beam_results, request, start_index=choice_index
             )
@@ -240,19 +230,16 @@ class OpenAIBeamSearchMixin:
         ret: List[Dict[str, Any]],
         created: int,
     ) -> ChatCompletionResponse:
-        """Build completion response for beam search results."""
-        # Group results by request.n: every n elements belong to one request
-        num_prompts = len(ret) // request.n
-        assert num_prompts * request.n == len(ret)
+        """Build completion response for beam search results.
 
+        ret is a list of packed dicts, each with meta_info.beam_results.
+        Each element corresponds to one request (single or one item in a batch).
+        """
         request_meta_list = []
         all_choices = []
-        for prompt_idx in range(num_prompts):
-            start_idx = prompt_idx * request.n
-            end_idx = start_idx + request.n
-            beam_results = ret[start_idx:end_idx]
-
-            request_meta_list.append(beam_results[0])
+        for packed in ret:
+            beam_results = packed.get("meta_info", {}).get("beam_results", [])
+            request_meta_list.append(packed)
             choices = self._process_chat_beam_search_results(
                 beam_results, request, start_index=len(all_choices)
             )
@@ -387,37 +374,28 @@ class OpenAIBeamSearchMixin:
         all_results: List[Any],
         request: CompletionRequest,
     ) -> AsyncGenerator[str, None]:
-        """Generate streaming response for beam search results."""
+        """Generate streaming response for beam search results.
+
+        all_results is a list of packed dicts, each with meta_info.beam_results.
+        Each element corresponds to one request (single or one item in a batch).
+        """
         created = int(time.time())
         request_id = None
-
-        # all_results is a flat list where each element is a beam result dict
-        # Every n beams belong to the same request (first beam has complete meta_info with id)
-        rid_to_beam_results = {}
-        cur_rid = None
-        for result in all_results:
-            meta_info = result.get("meta_info", {})
-            rid = meta_info.get("id", "")
-            if rid:
-                rid_to_beam_results[rid] = [result]
-                cur_rid = rid
-            else:
-                assert cur_rid is not None
-                rid_to_beam_results[cur_rid].append(result)
-
-        if not rid_to_beam_results:
-            logger.warning("No valid beam search results found in all_results")
-            yield "data: [DONE]\n\n"
-            return
 
         all_choices = []
         request_meta_list = []
         choice_index = 0
-        for rid, beam_results in rid_to_beam_results.items():
+        # Sort by index to ensure correct order for batch requests (asyncio.wait may yield out-of-order)
+        sorted_results = sorted(all_results, key=lambda x: x.get("index", 0))
+        for packed in sorted_results:
+            beam_results = packed.get("meta_info", {}).get("beam_results")
+            if not beam_results:
+                continue
+            rid = packed["meta_info"].get("id", "")
             if not request_id:
                 request_id = rid
 
-            request_meta_list.append(beam_results[0])
+            request_meta_list.append(packed)
             choices = self._process_completion_beam_search_results(
                 beam_results, request, start_index=choice_index
             )
@@ -472,19 +450,16 @@ class OpenAIBeamSearchMixin:
         ret: List[Dict[str, Any]],
         created: int,
     ) -> CompletionResponse:
-        """Build completion response for beam search results."""
-        # Group results by request.n: every n elements belong to one request
-        num_prompts = len(ret) // request.n
-        assert num_prompts * request.n == len(ret)
+        """Build completion response for beam search results.
 
+        ret is a list of packed dicts, each with meta_info.beam_results.
+        Each element corresponds to one request (single or one item in a batch).
+        """
         request_meta_list = []
         all_choices = []
-        for prompt_idx in range(num_prompts):
-            start_idx = prompt_idx * request.n
-            end_idx = start_idx + request.n
-            beam_results = ret[start_idx:end_idx]
-
-            request_meta_list.append(beam_results[0])
+        for packed in ret:
+            beam_results = packed.get("meta_info", {}).get("beam_results", [])
+            request_meta_list.append(packed)
             choices = self._process_completion_beam_search_results(
                 beam_results, request, start_index=len(all_choices)
             )

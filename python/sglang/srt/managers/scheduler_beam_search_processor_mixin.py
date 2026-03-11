@@ -922,7 +922,7 @@ class SchedulerBeamSearchProcessorMixin:
         )
 
         self.token_to_kv_pool_allocator.free(beam_decode_kv_indices)
-        self.req_to_token_pool.free(beam_pool_indices.tolist())
+        self.req_to_token_pool.free_by_indices(beam_pool_indices.tolist())
 
         for req in finished_reqs:
             release_kv_cache(req, self.tree_cache)

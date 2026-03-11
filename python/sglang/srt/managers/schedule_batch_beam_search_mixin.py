@@ -189,8 +189,10 @@ class ScheduleBatchBeamSearchMixin:
             return
 
         new_pool_slot_list = [req.beam_width for req in new_reqs]
-        beam_req_pool_indices = self.req_to_token_pool.alloc(sum(new_pool_slot_list))
-        if not beam_req_pool_indices:
+        total_slots = sum(new_pool_slot_list)
+
+        beam_req_pool_indices = self.req_to_token_pool.alloc_by_count(total_slots)
+        if beam_req_pool_indices is None:
             raise RuntimeError(
                 "Out of memory. Please set a smaller number for `--max-running-requests` or `--beam-width`."
             )

@@ -13,13 +13,8 @@
 # ==============================================================================
 """Mixin class for handling beam search in TokenizerManager."""
 
-import asyncio
 import logging
-import time
-from http import HTTPStatus
-from typing import Any, Dict, Union
-
-import fastapi
+from typing import Any, Dict, Optional, Union
 
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -27,68 +22,33 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.tracing.trace import trace_req_finish
 
 logger = logging.getLogger(__name__)
 
 
 class BeamSearchTokenizerManagerMixin:
-    async def wait_beam_search_response(
-        self,
-        out: Dict[str, Any],
-        state: Any,
-        obj: Any,
-    ):
-        """Handle beam search response and return all beam results as a single array."""
+    def build_beam_search_out(self, out: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert a beam search out dict (containing beam_results) to a regular out dict.
 
-        if not state.response_sent_to_client_ts:
-            state.response_sent_to_client_ts = time.time()
-
-        self.request_logger.log_finished_request(
-            obj, out, is_multimodal_gen=self.model_config.is_multimodal_gen
-        )
-
-        if self.request_metrics_exporter_manager.exporter_enabled():
-            # Asynchronously write metrics for this request using the exporter manager.
-            asyncio.create_task(
-                self.request_metrics_exporter_manager.write_record(obj, out)
-            )
-
+        Takes the first beam's meta_info as the top-level meta_info, and stores
+        the full beam_results list inside meta_info so callers can access all beams.
+        All post-processing (logging, metrics, abort handling, timing, etc.) is handled
+        by the shared _wait_one_response logic after this conversion.
+        """
         beam_results = out.get("beam_results", [])
-        if beam_results:
-            first_beam = beam_results[0]
-            first_beam["meta_info"][
-                "response_sent_to_client_ts"
-            ] = state.response_sent_to_client_ts
-            finish_reason = first_beam["meta_info"]["finish_reason"]
-            if isinstance(finish_reason, dict):
-                if (
-                    finish_reason.get("type") == "abort"
-                    and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
-                ):
-                    if not obj.stream:
-                        raise ValueError(finish_reason["message"])
+        if not beam_results:
+            return out
+        first_beam = beam_results[0]
+        # Use the first beam's fields as the top-level out, put all beams in meta_info.
+        converted = {
+            "text": first_beam.get("text", ""),
+            "output_ids": first_beam.get("output_ids", []),
+            "meta_info": first_beam.get("meta_info", {}).copy(),
+        }
+        converted["meta_info"]["beam_results"] = beam_results
+        return converted
 
-                if finish_reason.get("type") == "abort" and finish_reason.get(
-                    "status_code"
-                ) in (
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                ):
-                    if state.obj.rid in self.rid_to_state:
-                        del self.rid_to_state[state.obj.rid]
-                    if self.server_args.enable_lora and state.obj.lora_path:
-                        await self.lora_registry.release(state.obj.lora_id)
-
-                    if not obj.stream:
-                        raise fastapi.HTTPException(
-                            status_code=finish_reason["status_code"],
-                            detail=finish_reason["message"],
-                        )
-
-        return beam_results
-
-    def maybe_handle_beam_search_output(
+    def try_build_beam_search_out_dict(
         self,
         recv_obj: Union[
             BatchStrOutput,
@@ -97,13 +57,14 @@ class BeamSearchTokenizerManagerMixin:
             BatchTokenIDOutput,
         ],
         i: int,
-        rid: str,
-        state: Any,
         meta_info: Dict[str, Any],
-    ) -> bool:
+    ) -> Optional[dict]:
+        """If this item is a beam search result, build and return the out_dict.
+        Returns None if not a beam search item.
+        """
         # Only support BatchTokenIDOutput or BatchStrOutput for beam search
         if not isinstance(recv_obj, (BatchTokenIDOutput, BatchStrOutput)):
-            return False
+            return None
 
         beam_search_output = (
             recv_obj.beam_search_output[i]
@@ -116,56 +77,21 @@ class BeamSearchTokenizerManagerMixin:
             and beam_search_output.sequences
         )
         if not has_beam_search or recv_obj.finished_reasons[i] is None:
-            return False
+            return None
 
-        meta_info.update(
-            {
-                "completion_tokens": recv_obj.completion_tokens[i],
-                "cached_tokens": recv_obj.cached_tokens[i],
-            }
-        )
+        return self._build_beam_search_out_dict(beam_search_output, meta_info, recv_obj)
 
-        state.finished = True
-        state.finished_time = time.time()
-        state.finished_time_perf = time.perf_counter()
-        meta_info["e2e_latency"] = state.finished_time - state.created_time
-
-        if self.enable_metrics:
-            self._calculate_timing_metrics(meta_info, state, recv_obj, i)
-
-        trace_req_finish(rid, ts=int(state.finished_time * 1e9))
-
-        del self.rid_to_state[rid]
-
-        # Mark ongoing LoRA request as finished.
-        if self.server_args.enable_lora and state.obj.lora_path:
-            asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
-
-        self._process_beam_search_outputs(
-            beam_search_output, meta_info, recv_obj, state
-        )
-
-        state.event.set()
-
-        # Log metrics and dump
-        if self.enable_metrics and state.obj.log_metrics:
-            self.collect_metrics(state, recv_obj, i)
-        if self.dump_requests_folder and state.finished and state.obj.log_metrics:
-            self.dump_requests(state, state.out_list[-1])
-        if self.crash_dump_folder and state.finished and state.obj.log_metrics:
-            self.record_request_for_crash_dump(state, state.out_list[-1])
-
-        return True
-
-    def _process_beam_search_outputs(
+    def _build_beam_search_out_dict(
         self,
         beam_search_output: Any,
         meta_info: Dict[str, Any],
         recv_obj: Union[BatchStrOutput, BatchTokenIDOutput],
-        state: Any,
-    ) -> None:
-        """Process beam search outputs; the first element contains the request's meta_info, followed by all beam results."""
+    ) -> dict:
+        """Build the out_dict for a beam search result."""
         beam_results = []
+        total_completion_tokens = sum(
+            len(beam_seq.tokens) for beam_seq in beam_search_output.sequences
+        )
         for idx, beam_seq in enumerate(beam_search_output.sequences):
             if isinstance(recv_obj, BatchStrOutput):
                 beam_out_dict = {
@@ -180,6 +106,9 @@ class BeamSearchTokenizerManagerMixin:
                 continue
             if idx == 0:
                 beam_meta_info = meta_info.copy()
+                # Override completion_tokens with the sum of all beam sequences,
+                # since recv_obj.completion_tokens[i] only counts the first beam.
+                beam_meta_info["completion_tokens"] = total_completion_tokens
             else:
                 beam_meta_info = {}
             beam_meta_info["finish_reason"] = beam_seq.finish_reason
@@ -188,4 +117,4 @@ class BeamSearchTokenizerManagerMixin:
 
             beam_results.append(beam_out_dict)
 
-        state.out_list.append({"beam_results": beam_results})
+        return {"beam_results": beam_results}

@@ -184,14 +184,13 @@ class OpenAIBeamSearchMixin:
                             index=choice.index,
                             delta=DeltaMessage(content=choice.message.content),
                             finish_reason=None,
-                            sgl_ext=choice.sgl_ext,
                         )
                     ],
                     model=request.model,
                 )
                 yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-            # Final chunk: send finish_reason
+            # Final chunk: send finish_reason and sglext
             finish_chunk = ChatCompletionStreamResponse(
                 id=request_id,
                 created=created,
@@ -201,6 +200,7 @@ class OpenAIBeamSearchMixin:
                         delta=DeltaMessage(),
                         finish_reason=choice.finish_reason,
                         matched_stop=choice.matched_stop,
+                        sglext=choice.sglext,
                     )
                 ],
                 model=request.model,
@@ -332,7 +332,7 @@ class OpenAIBeamSearchMixin:
                 finish_reason=(finish_reason["type"] if finish_reason else "stop"),
                 matched_stop=(finish_reason.get("matched") if finish_reason else None),
                 hidden_states=None,
-                sgl_ext=sgl_ext,
+                sglext=sgl_ext,
             )
             choices.append(choice_data)
 
@@ -414,7 +414,7 @@ class OpenAIBeamSearchMixin:
                 logprobs=choice.logprobs,
                 finish_reason=choice.finish_reason,
                 matched_stop=choice.matched_stop,
-                sgl_ext=choice.sgl_ext,
+                sglext=choice.sglext,
             )
             chunk = CompletionStreamResponse(
                 id=request_id,
@@ -515,7 +515,7 @@ class OpenAIBeamSearchMixin:
                 finish_reason=(finish_reason["type"] if finish_reason else "stop"),
                 matched_stop=(finish_reason.get("matched") if finish_reason else None),
                 hidden_states=None,
-                sgl_ext=sgl_ext,
+                sglext=sgl_ext,
             )
             choices.append(choice_data)
 

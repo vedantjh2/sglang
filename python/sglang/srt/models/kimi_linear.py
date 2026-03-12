@@ -398,7 +398,9 @@ class KimiDeltaAttention(nn.Module):
             b=beta,
         )
 
-        norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))  # ... (h d) -> ... h d
+        norm_gate = g_proj_states.unflatten(
+            -1, (-1, self.head_dim)
+        )  # ... (h d) -> ... h d
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
 

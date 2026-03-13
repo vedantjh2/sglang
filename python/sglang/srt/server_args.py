@@ -1054,10 +1054,7 @@ class ServerArgs:
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
             self.disable_piecewise_cuda_graph = True
-        # 8. LoRA
-        if self.lora_paths or self.enable_lora:
-            self.disable_piecewise_cuda_graph = True
-        # 9. Multimodal / VLM models
+        # 8. Multimodal / VLM models
         if self.get_model_config().is_multimodal:
             self.disable_piecewise_cuda_graph = True
         # 10. GGUF quantized models (custom dequant ops unsupported by torch.compile)

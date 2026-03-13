@@ -9,7 +9,7 @@ from sglang.srt.utils import cached_triton_kernel
 @cached_triton_kernel(
     lambda _, kwargs: (kwargs["K"], kwargs["NUM_SLICES"], kwargs["BLOCK_M"])
 )
-@triton.jit(do_not_specialize=["num_segs"])
+@triton.jit
 def _chunked_lora_shrink_kernel(
     # Pointers to matrices
     x,
@@ -55,7 +55,7 @@ def _chunked_lora_shrink_kernel(
     output_stride_1: tl.constexpr = 1
 
     pid_s = tl.program_id(1)
-    if pid_s >= num_segs:
+    if pid_s >= tl.load(num_segs):
         return
 
     pid_n = tl.program_id(0)
@@ -163,7 +163,7 @@ def chunked_sgmv_lora_shrink_forward(
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
         permutation=batch_info.permutation,
-        num_segs=num_segments,
+        num_segs=batch_info.num_segments_tensor,
         # constants
         N=N,
         K=K,

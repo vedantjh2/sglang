@@ -40,6 +40,11 @@ class LoRABatchInfo:
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
     permutation: Optional[torch.Tensor]
 
+    # 1-element tensor holding num_segments on device, used by csgmv kernels
+    # in CUDA graph mode so the value can be updated between replays
+    # (scalar kernel args are baked into CUDA graphs and cannot change).
+    num_segments_tensor: Optional[torch.Tensor] = None
+
 
 class LoRAType(Enum):
     LORA_A = 0

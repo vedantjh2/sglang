@@ -50,8 +50,9 @@ def _chunked_embedding_lora_a_kernel(
     chunk_end = tl.load(seg_indptr + chunk_idx + 1)
     for c in range(chunk_start, chunk_end):
         s_index = tl.load(permutation + c)
-        # Load the token ID
+        # Load the token ID and clamp to valid range to prevent OOB access
         token_id = tl.load(input_ids + s_index)
+        token_id_clamped = tl.minimum(token_id, vocab_size - 1)
         # Process in chunks of BLOCK_RANK dimensions
         num_blocks = tl.cdiv(rank_val, BLOCK_RANK)
 
@@ -66,7 +67,7 @@ def _chunked_embedding_lora_a_kernel(
                 weights
                 + lora_index * w_stride_0
                 + rank_offset * w_stride_1
-                + token_id * w_stride_2
+                + token_id_clamped * w_stride_2
             )
             emb_values = tl.load(weight_ptr, mask=rank_mask, other=0.0)
 

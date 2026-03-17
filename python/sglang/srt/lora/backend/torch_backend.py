@@ -283,3 +283,11 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         batch_info.seg_indptr[: len(seg_indptr_cpu)].copy_(
             seg_indptr_cpu, non_blocking=True
         )
+        batch_info.seg_lens[: len(seg_lens_cpu)].copy_(seg_lens_cpu, non_blocking=True)
+
+        batch_info.lora_ranks_cpu = lora_ranks_tensor
+        batch_info.seg_indptr_cpu = seg_indptr_cpu
+        batch_info.seg_lens_cpu = seg_lens_cpu
+        batch_info.weight_indices_cpu = weight_indices_tensor
+
+        self.batch_info = batch_info

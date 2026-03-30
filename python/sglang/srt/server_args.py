@@ -3274,6 +3274,10 @@ class ServerArgs:
             self.chunked_prefill_size = -1
             modified.append("chunked prefill")
 
+        if self.page_size != 1:
+            self.page_size = 1
+            modified.append("page_size (forced to 1)")
+
         if modified:
             logger.warning(
                 f"Beam search enabled. Automatically disabled incompatible features: {', '.join(modified)}"

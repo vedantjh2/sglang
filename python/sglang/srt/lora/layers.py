@@ -22,7 +22,18 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.pcg_ops import (
+    lora_apply_column_pcg,
+    lora_apply_embedding_pcg,
+    lora_apply_gate_up_pcg,
+    lora_apply_lm_head_pcg,
+    lora_apply_qkv_pcg,
+    lora_apply_row_pcg,
+    lora_expand_pcg,
+    lora_shrink_pcg,
+)
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
 
 
@@ -198,9 +209,15 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         # Apply LoRA if configured
         if self.set_lora:
-            # The backend's run_lora_a_embedding now handles both regular
-            # and extra tokens efficiently with CUDA graph support
-            base_output = self.apply_lora(base_output, input_, batch_info)
+            if is_in_piecewise_cuda_graph():
+                lora_apply_embedding_pcg(
+                    input_, self.embedding_A_buffer, self.embedding_B_buffer,
+                    base_output, self.output_offset, self.vocab_size,
+                )
+            else:
+                # The backend's run_lora_a_embedding now handles both regular
+                # and extra tokens efficiently with CUDA graph support
+                base_output = self.apply_lora(base_output, input_, batch_info)
 
         return base_output
 
@@ -359,7 +376,13 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
 
         # Apply LoRA if set
         if self.set_lora:
-            base_output = self.apply_lora(base_output, hidden_states)
+            if is_in_piecewise_cuda_graph():
+                lora_apply_lm_head_pcg(
+                    hidden_states, self.lm_head_A_buffer, self.lm_head_B_buffer,
+                    base_output, self.output_offset,
+                )
+            else:
+                base_output = self.apply_lora(base_output, hidden_states)
 
         return base_output
 
@@ -443,7 +466,13 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
         if self.set_lora:
-            output_parallel = self.apply_lora(output_parallel, input_)
+            if is_in_piecewise_cuda_graph():
+                lora_apply_column_pcg(
+                    input_, self.A_buffer, self.B_buffer,
+                    output_parallel, self.output_offset,
+                )
+            else:
+                output_parallel = self.apply_lora(output_parallel, input_)
 
         if self.base_layer.gather_output:
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -500,6 +529,29 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             base_output=base_output,
         )
         return lora_output
+
+    def forward(self, input_: torch.Tensor):
+        # duplicate the logic in ColumnParallelLinear
+        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+        output_parallel = self.base_layer.quant_method.apply(
+            self.base_layer, input_, bias
+        )
+
+        if self.set_lora:
+            if is_in_piecewise_cuda_graph():
+                lora_apply_gate_up_pcg(
+                    input_, self.A_buffer_gate_up, self.B_buffer_gate_up,
+                    output_parallel, self.output_offset,
+                )
+            else:
+                output_parallel = self.apply_lora(output_parallel, input_)
+
+        if self.base_layer.gather_output:
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        return output, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         return A
@@ -564,6 +616,30 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
 
         return lora_output
+
+    def forward(self, input_: torch.Tensor):
+        # duplicate the logic in ColumnParallelLinear
+        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+        output_parallel = self.base_layer.quant_method.apply(
+            self.base_layer, input_, bias
+        )
+
+        if self.set_lora:
+            if is_in_piecewise_cuda_graph():
+                lora_apply_qkv_pcg(
+                    input_, self.A_buffer_qkv, self.B_buffer_qkv,
+                    output_parallel, self.output_offset,
+                    self.output_offset_cpu, self.max_qkv_out_dim,
+                )
+            else:
+                output_parallel = self.apply_lora(output_parallel, input_)
+
+        if self.base_layer.gather_output:
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        return output, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         return A
@@ -654,20 +730,34 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
         if self.set_lora and should_reduce:
-            lora_a_output = self.lora_backend.run_lora_a_sgemm(
-                input_parallel, self.A_buffer
-            )
+            if is_in_piecewise_cuda_graph():
+                lora_a_output = lora_shrink_pcg(input_parallel, self.A_buffer)
+            else:
+                lora_a_output = self.lora_backend.run_lora_a_sgemm(
+                    input_parallel, self.A_buffer
+                )
             output_ = tensor_model_parallel_all_reduce(output_parallel)
             lora_a_output = tensor_model_parallel_all_reduce(lora_a_output)
-            output_ = self.lora_backend.run_lora_b_sgemm(
-                x=lora_a_output,
-                weights=self.B_buffer,
-                output_offset=self.output_offset,
-                base_output=output_,
-            )
+            if is_in_piecewise_cuda_graph():
+                lora_expand_pcg(
+                    lora_a_output, self.B_buffer, output_, self.output_offset,
+                )
+            else:
+                output_ = self.lora_backend.run_lora_b_sgemm(
+                    x=lora_a_output,
+                    weights=self.B_buffer,
+                    output_offset=self.output_offset,
+                    base_output=output_,
+                )
         else:
             if self.set_lora:
-                output_parallel = self.apply_lora(output_parallel, input_parallel)
+                if is_in_piecewise_cuda_graph():
+                    lora_apply_row_pcg(
+                        input_parallel, self.A_buffer, self.B_buffer,
+                        output_parallel, self.output_offset,
+                    )
+                else:
+                    output_parallel = self.apply_lora(output_parallel, input_parallel)
             if should_reduce:
                 output_ = tensor_model_parallel_all_reduce(output_parallel)
             else:

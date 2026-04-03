@@ -348,6 +348,13 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
+
+        lora_ids = None
+        lora_backend = None
+        if self.model_runner.server_args.enable_lora:
+            lora_ids = [None] * 1
+            lora_backend = self.model_runner.lora_manager.lora_backend
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -388,8 +395,11 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                lora_ids=lora_ids,
             )
+
+        if lora_ids is not None:
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -402,6 +412,7 @@ class PiecewiseCudaGraphRunner:
             self.quant_config,
             self.moe_layers,
             self.moe_fusions,
+            lora_backend=lora_backend,
         ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -505,6 +516,10 @@ class PiecewiseCudaGraphRunner:
         else:
             lora_ids = None
 
+        lora_backend = None
+        if lora_ids is not None:
+            lora_backend = self.model_runner.lora_manager.lora_backend
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -545,7 +560,7 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                lora_ids=lora_ids,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -574,6 +589,7 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                lora_backend=lora_backend,
             ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -762,6 +778,15 @@ class PiecewiseCudaGraphRunner:
             # into call_begin_forward (via ForwardContext.num_tokens), eliminating the
             # need for a separate global and allowing pre-calculation of dummy-page count.
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+
+            # Prepare LoRA batch info for PCG replay
+            lora_backend = None
+            if self.model_runner.server_args.enable_lora:
+                self.model_runner.lora_manager.prepare_lora_batch(
+                    static_forward_batch
+                )
+                lora_backend = self.model_runner.lora_manager.lora_backend
+
             # Replay
             with set_forward_context(
                 static_forward_batch,
@@ -770,6 +795,7 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
                 num_tokens=static_num_tokens,
+                lora_backend=lora_backend,
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)

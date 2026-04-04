@@ -276,6 +276,12 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
+        # Pre-allocate LoRA PCG batch info at fixed GPU addresses
+        if self.model_runner.server_args.enable_lora:
+            self.model_runner.lora_manager.lora_backend.init_pcg_batch_info(
+                self.max_num_tokens
+            )
+
         with enable_piecewise_cuda_graph():
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
@@ -400,6 +406,11 @@ class PiecewiseCudaGraphRunner:
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+            self.model_runner.lora_manager.lora_backend.prepare_pcg_lora_batch(
+                forward_batch,
+                weight_indices=[0] * len(lora_ids),
+                scalings=[0.0] * self.model_runner.lora_manager.max_loras_per_batch,
+            )
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -566,6 +577,11 @@ class PiecewiseCudaGraphRunner:
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+            self.model_runner.lora_manager.lora_backend.prepare_pcg_lora_batch(
+                forward_batch,
+                weight_indices=[0] * len(lora_ids),
+                scalings=[0.0] * self.model_runner.lora_manager.max_loras_per_batch,
+            )
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
@@ -779,13 +795,24 @@ class PiecewiseCudaGraphRunner:
             # need for a separate global and allowing pre-calculation of dummy-page count.
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
 
-            # Prepare LoRA batch info for PCG replay
+            # Prepare LoRA batch info for PCG replay — update pre-allocated
+            # GPU tensors (adapter_mask, scaling) BEFORE graph replay so
+            # the captured kernels read the correct per-batch data.
             lora_backend = None
             if self.model_runner.server_args.enable_lora:
-                self.model_runner.lora_manager.prepare_lora_batch(
-                    static_forward_batch
+                lm = self.model_runner.lora_manager
+                lora_backend = lm.lora_backend
+                # Compute weight_indices and scalings from lora_ids
+                weight_indices = [0] * len(static_forward_batch.lora_ids)
+                scalings = [0.0] * lm.max_loras_per_batch
+                for i, uid in enumerate(static_forward_batch.lora_ids):
+                    weight_indices[i] = lm.memory_pool.get_buffer_id(uid)
+                    if uid is not None:
+                        lora = lm.loras[uid]
+                        scalings[weight_indices[i]] = lora.scaling
+                lora_backend.prepare_pcg_lora_batch(
+                    static_forward_batch, weight_indices, scalings,
                 )
-                lora_backend = self.model_runner.lora_manager.lora_backend
 
             # Replay
             with set_forward_context(

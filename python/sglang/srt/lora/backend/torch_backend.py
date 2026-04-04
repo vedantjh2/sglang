@@ -4,7 +4,12 @@ from typing import Optional
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.torch_ops import sgemm_lora_a_fwd, sgemm_lora_b_fwd
+from sglang.srt.lora.torch_ops import (
+    sgemm_lora_a_fwd,
+    sgemm_lora_a_fwd_pcg,
+    sgemm_lora_b_fwd,
+    sgemm_lora_b_fwd_pcg,
+)
 from sglang.srt.lora.utils import LoRABatchInfo, generate_sequence_lengths
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -37,6 +42,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device)
+        self.pcg_batch_info = None
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -178,6 +184,89 @@ class TorchNativeLoRABackend(BaseLoRABackend):
                 dim=0,
                 out=self.cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
             )
+
+    def init_pcg_batch_info(self, max_num_tokens: int):
+        """Pre-allocate GPU tensors for PCG CUDA graph capture."""
+        with torch.device("cuda"):
+            self.pcg_adapter_mask = torch.zeros(
+                self.max_loras_per_batch, max_num_tokens, dtype=torch.float32
+            )
+            self.pcg_scaling_gpu = torch.zeros(
+                self.max_loras_per_batch, dtype=torch.float32
+            )
+        self.pcg_max_num_tokens = max_num_tokens
+
+    def prepare_pcg_lora_batch(
+        self,
+        forward_batch: ForwardBatch,
+        weight_indices: list[int],
+        scalings: list[float],
+    ):
+        """Build adapter_mask and scaling for PCG mode.
+
+        Updates pre-allocated GPU tensors in-place (same addresses for CUDA graph replay).
+        """
+        seq_lens = generate_sequence_lengths(forward_batch, device="cpu")
+        num_tokens = int(seq_lens.sum().item())
+
+        # Build per-token adapter index on CPU then transfer
+        token_to_adapter = torch.zeros(
+            self.pcg_max_num_tokens, dtype=torch.int32, pin_memory=True
+        )
+        offset = 0
+        for i, sl in enumerate(seq_lens):
+            sl = int(sl.item())
+            token_to_adapter[offset : offset + sl] = weight_indices[i]
+            offset += sl
+
+        # Build adapter_mask: (max_loras, max_num_tokens)
+        # Zero everything first (handles padding tokens)
+        self.pcg_adapter_mask.zero_()
+        token_to_adapter_gpu = torch.tensor(
+            token_to_adapter[: self.pcg_max_num_tokens],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        for i in range(self.max_loras_per_batch):
+            self.pcg_adapter_mask[i].copy_(
+                (token_to_adapter_gpu == i).float(), non_blocking=True
+            )
+
+        # Update scaling
+        scalings_tensor = torch.tensor(
+            scalings, dtype=torch.float32, pin_memory=True
+        )
+        self.pcg_scaling_gpu[: len(scalings)].copy_(
+            scalings_tensor, non_blocking=True
+        )
+
+    def run_lora_a_sgemm_pcg(
+        self, x: torch.Tensor, weights: torch.Tensor, num_slices: int = 1
+    ) -> torch.Tensor:
+        return sgemm_lora_a_fwd_pcg(
+            inputs=x,
+            weights=weights,
+            adapter_mask=self.pcg_adapter_mask,
+            scaling_gpu=self.pcg_scaling_gpu,
+            max_loras=self.max_loras_per_batch,
+            num_slices=num_slices,
+        )
+
+    def run_lora_b_sgemm_pcg(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        slice_offsets: torch.Tensor,
+        base_output: torch.Tensor = None,
+    ) -> torch.Tensor:
+        return sgemm_lora_b_fwd_pcg(
+            inputs=x,
+            weights=weights,
+            adapter_mask=self.pcg_adapter_mask,
+            slice_offsets=slice_offsets,
+            max_loras=self.max_loras_per_batch,
+            base_output=base_output,
+        )
 
     def prepare_lora_batch(
         self,

@@ -3,6 +3,108 @@ from typing import Optional
 import torch
 
 
+# ──────────────────────────────────────────────────────────────────────
+# CUDA-graph-compatible LoRA kernels for PCG
+#
+# These replace the Python-loop-based kernels with fixed-iteration GPU ops.
+# For each adapter slot (0..max_loras-1), we do a FULL matmul over ALL tokens,
+# then mask out tokens that don't belong to that adapter. The loop count is
+# always max_loras (constant), all indexing uses GPU tensors, and there are
+# no .item() calls — making these safe for CUDA graph capture and replay.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def sgemm_lora_a_fwd_pcg(
+    inputs: torch.Tensor,
+    weights: torch.Tensor,
+    adapter_mask: torch.Tensor,
+    scaling_gpu: torch.Tensor,
+    max_loras: int,
+    num_slices: int = 1,
+) -> torch.Tensor:
+    """CUDA-graph-compatible LoRA A forward (shrink).
+
+    Args:
+        inputs: (total_tokens, input_dim)
+        weights: (num_loras, num_slices * max_rank, input_dim)
+        adapter_mask: (max_loras, total_tokens) float — 1.0 for tokens using adapter i, else 0.0
+        scaling_gpu: (max_loras,) float — scaling factor per adapter
+        max_loras: fixed iteration count
+        num_slices: number of output slices (1 for column, 2 for gate_up, 3 for QKV)
+    """
+    total_tokens, input_dim = inputs.shape
+    _, weight_out_dim, _ = weights.shape
+
+    output = torch.zeros(
+        total_tokens, weight_out_dim, dtype=inputs.dtype, device=inputs.device
+    )
+
+    for i in range(max_loras):
+        # Full matmul: all tokens × adapter i's weight
+        temp = torch.mm(inputs, weights[i].T)  # (total_tokens, weight_out_dim)
+        # Mask: zero out tokens not using adapter i, and apply scaling
+        temp = temp * (adapter_mask[i].unsqueeze(1) * scaling_gpu[i])
+        # Accumulate
+        output = output + temp
+
+    return output
+
+
+def sgemm_lora_b_fwd_pcg(
+    inputs: torch.Tensor,
+    weights: torch.Tensor,
+    adapter_mask: torch.Tensor,
+    slice_offsets: torch.Tensor,
+    max_loras: int,
+    base_output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """CUDA-graph-compatible LoRA B forward (expand).
+
+    Args:
+        inputs: (total_tokens, num_slices * max_rank) — output from LoRA A
+        weights: (num_loras, output_dim, max_rank)
+        adapter_mask: (max_loras, total_tokens) float
+        slice_offsets: (num_slices + 1,) int — cumulative output slice boundaries
+        max_loras: fixed iteration count
+        base_output: (total_tokens, total_output_dim) — mutated in-place if provided
+    """
+    total_tokens, _ = inputs.shape
+    num_loras, weight_out_dim, max_rank = weights.shape
+    num_slices = len(slice_offsets) - 1
+    total_output_dim = slice_offsets[-1].item()
+
+    if base_output is not None:
+        output = base_output
+    else:
+        output = torch.zeros(
+            total_tokens, total_output_dim, dtype=inputs.dtype, device=inputs.device
+        )
+
+    for i in range(max_loras):
+        mask_col = adapter_mask[i].unsqueeze(1)  # (total_tokens, 1)
+        for s in range(num_slices):
+            s_start_in = s * max_rank
+            s_end_in = (s + 1) * max_rank
+            s_start_out = slice_offsets[s]
+            s_end_out = slice_offsets[s + 1]
+
+            x_slice = inputs[:, s_start_in:s_end_in]  # (total_tokens, max_rank)
+            w_slice = weights[i, s_start_out:s_end_out, :]  # (slice_dim, max_rank)
+
+            temp = torch.mm(x_slice, w_slice.T)  # (total_tokens, slice_dim)
+            temp = temp * mask_col
+            output[:, s_start_out:s_end_out] = (
+                output[:, s_start_out:s_end_out] + temp
+            )
+
+    return output
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Original (non-PCG) kernels below
+# ──────────────────────────────────────────────────────────────────────
+
+
 def sgemm_lora_a_fwd(
     inputs: torch.Tensor,
     weights: torch.Tensor,

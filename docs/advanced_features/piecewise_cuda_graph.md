@@ -166,6 +166,7 @@ PCG is auto-disabled in the following scenarios. We are actively working on expa
 - Pipeline parallelism (`pp_size > 1`)
 - Non-CUDA hardware (AMD ROCm, Ascend NPU)
 - MoE A2A backend
+- LoRA (non-torch_native backends)
 - Multimodal / VLM models
 - DLLM (diffusion LLM)
 - Deterministic inference

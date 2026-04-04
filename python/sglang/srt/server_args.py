@@ -1103,7 +1103,9 @@ class ServerArgs:
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
             self.disable_piecewise_cuda_graph = True
-        # 8. LoRA - PCG is now supported with LoRA via split ops
+        # 8. LoRA - PCG is supported with torch_native backend via split ops
+        if (self.lora_paths or self.enable_lora) and self.lora_backend != "torch_native":
+            self.disable_piecewise_cuda_graph = True
         # 9. Multimodal / VLM models
         if self.get_model_config().is_multimodal:
             self.disable_piecewise_cuda_graph = True

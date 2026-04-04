@@ -257,14 +257,14 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
-        slice_offsets: torch.Tensor,
+        slice_offsets_list: list,
         base_output: torch.Tensor = None,
     ) -> torch.Tensor:
         return sgemm_lora_b_fwd_pcg(
             inputs=x,
             weights=weights,
             adapter_mask=self.pcg_adapter_mask,
-            slice_offsets=slice_offsets,
+            slice_offsets_cpu=slice_offsets_list,
             max_loras=self.max_loras_per_batch,
             base_output=base_output,
         )

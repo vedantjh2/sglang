@@ -56,7 +56,7 @@ def sgemm_lora_b_fwd_pcg(
     inputs: torch.Tensor,
     weights: torch.Tensor,
     adapter_mask: torch.Tensor,
-    slice_offsets: torch.Tensor,
+    slice_offsets_cpu: list,
     max_loras: int,
     base_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -65,21 +65,20 @@ def sgemm_lora_b_fwd_pcg(
     Args:
         inputs: (total_tokens, num_slices * max_rank) — output from LoRA A
         weights: (num_loras, output_dim, max_rank)
-        adapter_mask: (max_loras, total_tokens) float
-        slice_offsets: (num_slices + 1,) int — cumulative output slice boundaries
+        adapter_mask: (max_loras, total_tokens) dtype matching inputs
+        slice_offsets_cpu: list of Python ints — cumulative output slice boundaries
         max_loras: fixed iteration count
         base_output: (total_tokens, total_output_dim) — mutated in-place if provided
     """
     total_tokens, _ = inputs.shape
     num_loras, weight_out_dim, max_rank = weights.shape
-    num_slices = len(slice_offsets) - 1
-    total_output_dim = slice_offsets[-1].item()
+    num_slices = len(slice_offsets_cpu) - 1
 
     if base_output is not None:
         output = base_output
     else:
         output = torch.zeros(
-            total_tokens, total_output_dim, dtype=inputs.dtype, device=inputs.device
+            total_tokens, weight_out_dim, dtype=inputs.dtype, device=inputs.device
         )
 
     for i in range(max_loras):
@@ -87,8 +86,8 @@ def sgemm_lora_b_fwd_pcg(
         for s in range(num_slices):
             s_start_in = s * max_rank
             s_end_in = (s + 1) * max_rank
-            s_start_out = slice_offsets[s]
-            s_end_out = slice_offsets[s + 1]
+            s_start_out = slice_offsets_cpu[s]
+            s_end_out = slice_offsets_cpu[s + 1]
 
             x_slice = inputs[:, s_start_in:s_end_in]  # (total_tokens, max_rank)
             w_slice = weights[i, s_start_out:s_end_out, :]  # (slice_dim, max_rank)

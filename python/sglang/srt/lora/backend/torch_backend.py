@@ -185,14 +185,15 @@ class TorchNativeLoRABackend(BaseLoRABackend):
                 out=self.cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
             )
 
-    def init_pcg_batch_info(self, max_num_tokens: int):
+    def init_pcg_batch_info(self, max_num_tokens: int, dtype: torch.dtype = torch.float16):
         """Pre-allocate GPU tensors for PCG CUDA graph capture."""
+        self.pcg_dtype = dtype
         with torch.device("cuda"):
             self.pcg_adapter_mask = torch.zeros(
-                self.max_loras_per_batch, max_num_tokens, dtype=torch.float32
+                self.max_loras_per_batch, max_num_tokens, dtype=dtype
             )
             self.pcg_scaling_gpu = torch.zeros(
-                self.max_loras_per_batch, dtype=torch.float32
+                self.max_loras_per_batch, dtype=dtype
             )
         self.pcg_max_num_tokens = max_num_tokens
 
@@ -229,12 +230,12 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         )
         for i in range(self.max_loras_per_batch):
             self.pcg_adapter_mask[i].copy_(
-                (token_to_adapter_gpu == i).float(), non_blocking=True
+                (token_to_adapter_gpu == i).to(self.pcg_dtype), non_blocking=True
             )
 
         # Update scaling
         scalings_tensor = torch.tensor(
-            scalings, dtype=torch.float32, pin_memory=True
+            scalings, dtype=self.pcg_dtype, pin_memory=True
         )
         self.pcg_scaling_gpu[: len(scalings)].copy_(
             scalings_tensor, non_blocking=True

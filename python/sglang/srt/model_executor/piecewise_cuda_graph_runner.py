@@ -279,7 +279,7 @@ class PiecewiseCudaGraphRunner:
         # Pre-allocate LoRA PCG batch info at fixed GPU addresses
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.lora_backend.init_pcg_batch_info(
-                self.max_num_tokens
+                self.max_num_tokens, dtype=self.model_runner.dtype,
             )
 
         with enable_piecewise_cuda_graph():

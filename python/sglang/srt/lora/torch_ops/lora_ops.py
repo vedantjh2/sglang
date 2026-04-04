@@ -43,7 +43,9 @@ def sgemm_lora_a_fwd_pcg(
         # Full matmul: all tokens × adapter i's weight
         temp = torch.mm(inputs, weights[i].T)  # (total_tokens, weight_out_dim)
         # Mask: zero out tokens not using adapter i, and apply scaling
-        temp = temp * (adapter_mask[i].unsqueeze(1) * scaling_gpu[i])
+        # Slice adapter_mask to actual token count (mask is pre-allocated at max size)
+        mask_i = adapter_mask[i, :total_tokens].unsqueeze(1)  # (total_tokens, 1)
+        temp = temp * (mask_i * scaling_gpu[i])
         # Accumulate
         output = output + temp
 
@@ -81,7 +83,7 @@ def sgemm_lora_b_fwd_pcg(
         )
 
     for i in range(max_loras):
-        mask_col = adapter_mask[i].unsqueeze(1)  # (total_tokens, 1)
+        mask_col = adapter_mask[i, :total_tokens].unsqueeze(1)  # (total_tokens, 1)
         for s in range(num_slices):
             s_start_in = s * max_rank
             s_end_in = (s + 1) * max_rank

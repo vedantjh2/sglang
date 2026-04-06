@@ -279,7 +279,7 @@ class PiecewiseCudaGraphRunner:
         # Pre-allocate LoRA PCG batch info at fixed GPU addresses
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.lora_backend.init_pcg_batch_info(
-                self.max_num_tokens, dtype=self.model_runner.dtype,
+                self.max_num_tokens,
             )
 
         with enable_piecewise_cuda_graph():
@@ -405,11 +405,12 @@ class PiecewiseCudaGraphRunner:
             )
 
         if lora_ids is not None:
-            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
-            self.model_runner.lora_manager.lora_backend.prepare_pcg_lora_batch(
-                forward_batch,
-                weight_indices=[0] * len(lora_ids),
-                scalings=[0.0] * self.model_runner.lora_manager.max_loras_per_batch,
+            lm = self.model_runner.lora_manager
+            weight_indices = [0] * len(lora_ids)
+            lora_ranks = [0] * lm.max_loras_per_batch
+            scalings = [0.0] * lm.max_loras_per_batch
+            lm.lora_backend.prepare_pcg_lora_batch(
+                forward_batch, weight_indices, lora_ranks, scalings,
             )
 
         # Attention backend
@@ -576,11 +577,12 @@ class PiecewiseCudaGraphRunner:
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
-            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
-            self.model_runner.lora_manager.lora_backend.prepare_pcg_lora_batch(
-                forward_batch,
-                weight_indices=[0] * len(lora_ids),
-                scalings=[0.0] * self.model_runner.lora_manager.max_loras_per_batch,
+            lm = self.model_runner.lora_manager
+            weight_indices = [0] * len(lora_ids)
+            lora_ranks = [0] * lm.max_loras_per_batch
+            scalings = [0.0] * lm.max_loras_per_batch
+            lm.lora_backend.prepare_pcg_lora_batch(
+                forward_batch, weight_indices, lora_ranks, scalings,
             )
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -796,22 +798,24 @@ class PiecewiseCudaGraphRunner:
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
 
             # Prepare LoRA batch info for PCG replay — update pre-allocated
-            # GPU tensors (adapter_mask, scaling) BEFORE graph replay so
-            # the captured kernels read the correct per-batch data.
+            # GPU tensors BEFORE graph replay so the captured Triton kernels
+            # read the correct per-batch data from the same addresses.
             lora_backend = None
             if self.model_runner.server_args.enable_lora:
                 lm = self.model_runner.lora_manager
                 lora_backend = lm.lora_backend
-                # Compute weight_indices and scalings from lora_ids
+                # Compute weight_indices, lora_ranks, scalings from lora_ids
                 weight_indices = [0] * len(static_forward_batch.lora_ids)
+                lora_ranks = [0] * lm.max_loras_per_batch
                 scalings = [0.0] * lm.max_loras_per_batch
                 for i, uid in enumerate(static_forward_batch.lora_ids):
                     weight_indices[i] = lm.memory_pool.get_buffer_id(uid)
                     if uid is not None:
                         lora = lm.loras[uid]
+                        lora_ranks[weight_indices[i]] = lora.config.r
                         scalings[weight_indices[i]] = lora.scaling
                 lora_backend.prepare_pcg_lora_batch(
-                    static_forward_batch, weight_indices, scalings,
+                    static_forward_batch, weight_indices, lora_ranks, scalings,
                 )
 
             # Replay

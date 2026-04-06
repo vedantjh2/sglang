@@ -2,8 +2,8 @@
 
 These custom ops wrap LoRA backend calls so they are opaque to torch.compile
 (via @register_custom_op). They are NOT split ops — they get captured INSIDE
-the CUDA graph. The LoRA kernels use pre-allocated GPU tensors (adapter_mask,
-scaling_gpu) that are updated via copy_() before each graph replay.
+the CUDA graph. The backend's batch_info is pre-allocated at fixed GPU addresses
+and updated via copy_() before each graph replay.
 """
 
 import torch
@@ -18,26 +18,6 @@ def _get_lora_backend():
     return ctx.lora_backend
 
 
-def _offsets_to_list(offset_tensor: torch.Tensor) -> list:
-    """Convert offset tensor to Python list. Must be called before CUDA graph capture
-    (e.g., cached during layer init). For tensors that are model constants, this is safe."""
-    if offset_tensor.is_cuda:
-        return offset_tensor.cpu().tolist()
-    return offset_tensor.tolist()
-
-
-# Cache for offset lists — avoids GPU sync during capture
-_offset_cache: dict = {}
-
-
-def _get_cached_offsets(offset_tensor: torch.Tensor) -> list:
-    """Get or cache the Python list of offsets for a constant tensor."""
-    tid = offset_tensor.data_ptr()
-    if tid not in _offset_cache:
-        _offset_cache[tid] = _offsets_to_list(offset_tensor)
-    return _offset_cache[tid]
-
-
 # ──────────────────────────────────────────────────────────────────────
 # ColumnParallelLinearWithLoRA: combined A + B, mutates base_output
 # ──────────────────────────────────────────────────────────────────────
@@ -50,10 +30,9 @@ def lora_apply_column_pcg(
     output_offset: torch.Tensor,
 ) -> None:
     backend = _get_lora_backend()
-    offsets = _get_cached_offsets(output_offset)
-    lora_a_out = backend.run_lora_a_sgemm_pcg(x, lora_a)
-    backend.run_lora_b_sgemm_pcg(
-        lora_a_out, lora_b, slice_offsets_list=offsets, base_output=base_output,
+    lora_a_out = backend.run_lora_a_sgemm(x, lora_a)
+    backend.run_lora_b_sgemm(
+        lora_a_out, lora_b, output_offset=output_offset, base_output=base_output,
     )
 
 
@@ -71,10 +50,10 @@ def lora_apply_qkv_pcg(
     max_qkv_out_dim: int,
 ) -> None:
     backend = _get_lora_backend()
-    offsets = _get_cached_offsets(output_offset)
-    lora_a_out = backend.run_lora_a_sgemm_pcg(x, qkv_lora_a, num_slices=3)
-    backend.run_lora_b_sgemm_pcg(
-        lora_a_out, qkv_lora_b, slice_offsets_list=offsets, base_output=base_output,
+    backend.run_qkv_lora(
+        x=x, qkv_lora_a=qkv_lora_a, qkv_lora_b=qkv_lora_b,
+        base_output=base_output, output_offset=output_offset,
+        output_offset_cpu=output_offset_cpu, max_qkv_out_dim=max_qkv_out_dim,
     )
 
 
@@ -90,10 +69,9 @@ def lora_apply_gate_up_pcg(
     output_offset: torch.Tensor,
 ) -> None:
     backend = _get_lora_backend()
-    offsets = _get_cached_offsets(output_offset)
-    lora_a_out = backend.run_lora_a_sgemm_pcg(x, gate_up_lora_a, num_slices=2)
-    backend.run_lora_b_sgemm_pcg(
-        lora_a_out, gate_up_lora_b, slice_offsets_list=offsets, base_output=base_output,
+    backend.run_gate_up_lora(
+        x=x, gate_up_lora_a=gate_up_lora_a, gate_up_lora_b=gate_up_lora_b,
+        base_output=base_output, output_offset=output_offset,
     )
 
 
@@ -110,7 +88,7 @@ def lora_shrink_pcg(
     lora_a: torch.Tensor,
 ) -> torch.Tensor:
     backend = _get_lora_backend()
-    return backend.run_lora_a_sgemm_pcg(x, lora_a)
+    return backend.run_lora_a_sgemm(x, lora_a)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -124,9 +102,8 @@ def lora_expand_pcg(
     output_offset: torch.Tensor,
 ) -> None:
     backend = _get_lora_backend()
-    offsets = _get_cached_offsets(output_offset)
-    backend.run_lora_b_sgemm_pcg(
-        lora_a_out, lora_b, slice_offsets_list=offsets, base_output=base_output,
+    backend.run_lora_b_sgemm(
+        lora_a_out, lora_b, output_offset=output_offset, base_output=base_output,
     )
 
 
@@ -142,10 +119,9 @@ def lora_apply_row_pcg(
     output_offset: torch.Tensor,
 ) -> None:
     backend = _get_lora_backend()
-    offsets = _get_cached_offsets(output_offset)
-    lora_a_out = backend.run_lora_a_sgemm_pcg(x, lora_a)
-    backend.run_lora_b_sgemm_pcg(
-        lora_a_out, lora_b, slice_offsets_list=offsets, base_output=base_output,
+    lora_a_out = backend.run_lora_a_sgemm(x, lora_a)
+    backend.run_lora_b_sgemm(
+        lora_a_out, lora_b, output_offset=output_offset, base_output=base_output,
     )
 
 
@@ -162,12 +138,11 @@ def lora_apply_embedding_pcg(
     vocab_size: int,
 ) -> None:
     backend = _get_lora_backend()
-    offsets = _get_cached_offsets(output_offset)
     lora_a_out = backend.run_lora_a_embedding(
         input_ids=input_ids, weights=embedding_A, vocab_size=vocab_size,
     )
-    backend.run_lora_b_sgemm_pcg(
-        lora_a_out, embedding_B, slice_offsets_list=offsets, base_output=base_output,
+    backend.run_lora_b_sgemm(
+        lora_a_out, embedding_B, output_offset=output_offset, base_output=base_output,
     )
 
 
@@ -183,8 +158,7 @@ def lora_apply_lm_head_pcg(
     output_offset: torch.Tensor,
 ) -> None:
     backend = _get_lora_backend()
-    offsets = _get_cached_offsets(output_offset)
-    lora_a_out = backend.run_lora_a_sgemm_pcg(hidden_states, lm_head_A)
-    backend.run_lora_b_sgemm_pcg(
-        lora_a_out, lm_head_B, slice_offsets_list=offsets, base_output=base_output,
+    lora_a_out = backend.run_lora_a_sgemm(hidden_states, lm_head_A)
+    backend.run_lora_b_sgemm(
+        lora_a_out, lm_head_B, output_offset=output_offset, base_output=base_output,
     )

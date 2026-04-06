@@ -224,6 +224,96 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 max_len=None,  # Not used in CSGMV backend
             )
 
+    def init_pcg_batch_info(self, max_num_tokens: int):
+        """Pre-allocate batch info at fixed GPU addresses for piecewise CUDA graph.
+
+        The Triton kernel grid size is set to max_segments (fixed). Unused segments
+        are padded with zero-length entries and weight_indices=0 (base model, rank=0),
+        making the kernel a no-op for those segments.
+        """
+        # Upper bound: every MIN_CHUNK_SIZE tokens could be a separate segment,
+        # times max_loras_per_batch for adapter boundaries
+        self.pcg_max_segments = (
+            (max_num_tokens + MIN_CHUNK_SIZE - 1) // MIN_CHUNK_SIZE
+        ) * self.max_loras_per_batch
+        self.pcg_max_num_tokens = max_num_tokens
+        with torch.device("cuda"):
+            self.pcg_batch_info = LoRABatchInfo(
+                bs=self.pcg_max_segments,  # Grid size = max_segments
+                use_cuda_graph=True,
+                seg_lens=torch.zeros(self.pcg_max_segments, dtype=torch.int32),
+                seg_indptr=torch.zeros(self.pcg_max_segments + 1, dtype=torch.int32),
+                weight_indices=torch.zeros(self.pcg_max_segments, dtype=torch.int32),
+                permutation=torch.zeros(max_num_tokens, dtype=torch.int32),
+                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+                num_segments=self.pcg_max_segments,
+                max_len=self.max_chunk_size,
+            )
+
+    def prepare_pcg_lora_batch(
+        self,
+        forward_batch: ForwardBatch,
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+    ):
+        """Prepare LoRA batch for PCG mode — updates pre-allocated tensors in-place."""
+        chunk_size = self._determine_chunk_size(forward_batch)
+
+        permutation, weight_indices_reordered = (
+            ChunkedSgmvLoRABackend._get_permutation(
+                seq_weight_indices=weight_indices,
+                forward_batch=forward_batch,
+            )
+        )
+
+        seg_weight_indices, seg_indptr = self._get_segments_info(
+            weights_reordered=weight_indices_reordered,
+            chunk_size=chunk_size,
+        )
+        actual_segments = len(seg_weight_indices)
+
+        lora_ranks_tensor = torch.tensor(
+            lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
+        )
+        scalings_tensor = torch.tensor(
+            scalings, dtype=torch.float, pin_memory=True, device="cpu"
+        )
+
+        batch_info = self.pcg_batch_info
+        # Do NOT change batch_info.bs or batch_info.num_segments — they must stay
+        # at max_segments for a fixed CUDA graph grid size.
+        batch_info.max_len = chunk_size
+
+        # Copy actual data
+        batch_info.lora_ranks[: self.max_loras_per_batch].copy_(
+            lora_ranks_tensor, non_blocking=True
+        )
+        batch_info.scalings[: self.max_loras_per_batch].copy_(
+            scalings_tensor, non_blocking=True
+        )
+        batch_info.weight_indices[:actual_segments].copy_(
+            seg_weight_indices, non_blocking=True
+        )
+        batch_info.seg_indptr[: actual_segments + 1].copy_(
+            seg_indptr, non_blocking=True
+        )
+        batch_info.permutation[: len(permutation)].copy_(
+            permutation, non_blocking=True
+        )
+
+        # Pad unused segments: zero-length, weight_indices=0 (base model, rank=0 → no-op)
+        if actual_segments < self.pcg_max_segments:
+            # seg_indptr beyond actual segments all equal to last value (zero-length)
+            last_indptr = seg_indptr[-1].item()
+            batch_info.seg_indptr[actual_segments + 1 : self.pcg_max_segments + 1].fill_(
+                last_indptr
+            )
+            batch_info.weight_indices[actual_segments : self.pcg_max_segments].fill_(0)
+
+        self.batch_info = batch_info
+
     def prepare_lora_batch(
         self,
         forward_batch: ForwardBatch,

@@ -224,24 +224,20 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 max_len=None,  # Not used in CSGMV backend
             )
 
+    def _pcg_max_segments_for_tokens(self, num_tokens: int) -> int:
+        """Tight upper bound on segments for a given token count."""
+        chunk_size = self._determine_chunk_size_for_tokens(num_tokens)
+        return ((num_tokens + chunk_size - 1) // chunk_size) * self.max_loras_per_batch
+
     def init_pcg_batch_info(self, max_num_tokens: int):
         """Pre-allocate batch info at fixed GPU addresses for piecewise CUDA graph.
 
-        The Triton kernel grid size is set to max_segments (fixed). Unused segments
-        are padded with zero-length entries and weight_indices=0 (base model, rank=0),
-        making the kernel a no-op for those segments.
+        Tensors are allocated for the largest token count. For each captured
+        graph, batch_info.bs is set to a tight per-token-count bound via
+        set_pcg_grid_size(), so smaller captures get a proportionally smaller
+        Triton grid (fewer no-op thread blocks).
         """
-        # Upper bound: max_loras_per_batch adapters, each chunked at max_chunk_size.
-        # Cap to avoid excessive Triton grid size (no-op thread blocks are cheap
-        # but still launch overhead). A batch with N tokens and C chunk_size has
-        # at most ceil(N/C) * num_adapters_in_batch segments. Since
-        # num_adapters_in_batch <= max_loras_per_batch, we use that as bound.
-        chunk_size = max(self.max_chunk_size, MIN_CHUNK_SIZE)
-        segments_per_adapter = (max_num_tokens + chunk_size - 1) // chunk_size
-        self.pcg_max_segments = min(
-            segments_per_adapter * self.max_loras_per_batch,
-            512,  # Hard cap — practical workloads rarely exceed this
-        )
+        self.pcg_max_segments = self._pcg_max_segments_for_tokens(max_num_tokens)
         self.pcg_max_num_tokens = max_num_tokens
         with torch.device("cuda"):
             self.pcg_batch_info = LoRABatchInfo(
@@ -288,8 +284,17 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
 
         batch_info = self.pcg_batch_info
-        # Do NOT change batch_info.bs or batch_info.num_segments — they must stay
-        # at max_segments for a fixed CUDA graph grid size.
+        # Set grid size based on token count. Each captured CUDA graph bakes in
+        # this grid size. During replay the graph uses its own captured grid,
+        # so changing .bs here only affects the CURRENT capture/warmup.
+        num_tokens = (
+            forward_batch.extend_num_tokens
+            if forward_batch.forward_mode.is_extend()
+            else forward_batch.batch_size
+        )
+        grid_segments = self._pcg_max_segments_for_tokens(num_tokens)
+        batch_info.bs = min(grid_segments, self.pcg_max_segments)
+        batch_info.num_segments = batch_info.bs
         batch_info.max_len = chunk_size
 
         # Copy actual data
@@ -310,13 +315,13 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
 
         # Pad unused segments: zero-length, weight_indices=0 (base model, rank=0 → no-op)
-        if actual_segments < self.pcg_max_segments:
-            # seg_indptr beyond actual segments all equal to last value (zero-length)
+        grid_size = batch_info.bs
+        if actual_segments < grid_size:
             last_indptr = seg_indptr[-1].item()
-            batch_info.seg_indptr[actual_segments + 1 : self.pcg_max_segments + 1].fill_(
+            batch_info.seg_indptr[actual_segments + 1 : grid_size + 1].fill_(
                 last_indptr
             )
-            batch_info.weight_indices[actual_segments : self.pcg_max_segments].fill_(0)
+            batch_info.weight_indices[actual_segments : grid_size].fill_(0)
 
         self.batch_info = batch_info
 

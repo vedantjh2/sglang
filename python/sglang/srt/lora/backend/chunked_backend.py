@@ -231,11 +231,17 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         are padded with zero-length entries and weight_indices=0 (base model, rank=0),
         making the kernel a no-op for those segments.
         """
-        # Upper bound: max_loras_per_batch adapters, each chunked at max_chunk_size
+        # Upper bound: max_loras_per_batch adapters, each chunked at max_chunk_size.
+        # Cap to avoid excessive Triton grid size (no-op thread blocks are cheap
+        # but still launch overhead). A batch with N tokens and C chunk_size has
+        # at most ceil(N/C) * num_adapters_in_batch segments. Since
+        # num_adapters_in_batch <= max_loras_per_batch, we use that as bound.
         chunk_size = max(self.max_chunk_size, MIN_CHUNK_SIZE)
-        self.pcg_max_segments = (
-            (max_num_tokens + chunk_size - 1) // chunk_size
-        ) * self.max_loras_per_batch
+        segments_per_adapter = (max_num_tokens + chunk_size - 1) // chunk_size
+        self.pcg_max_segments = min(
+            segments_per_adapter * self.max_loras_per_batch,
+            512,  # Hard cap — practical workloads rarely exceed this
+        )
         self.pcg_max_num_tokens = max_num_tokens
         with torch.device("cuda"):
             self.pcg_batch_info = LoRABatchInfo(

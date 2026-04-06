@@ -231,10 +231,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         are padded with zero-length entries and weight_indices=0 (base model, rank=0),
         making the kernel a no-op for those segments.
         """
-        # Upper bound: every MIN_CHUNK_SIZE tokens could be a separate segment,
-        # times max_loras_per_batch for adapter boundaries
+        # Upper bound: max_loras_per_batch adapters, each chunked at max_chunk_size
+        chunk_size = max(self.max_chunk_size, MIN_CHUNK_SIZE)
         self.pcg_max_segments = (
-            (max_num_tokens + MIN_CHUNK_SIZE - 1) // MIN_CHUNK_SIZE
+            (max_num_tokens + chunk_size - 1) // chunk_size
         ) * self.max_loras_per_batch
         self.pcg_max_num_tokens = max_num_tokens
         with torch.device("cuda"):

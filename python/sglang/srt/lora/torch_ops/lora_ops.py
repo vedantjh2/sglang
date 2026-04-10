@@ -35,10 +35,10 @@ def sgemm_lora_a_fwd(
     # Shape: (n_active, max_seg_len, input_dim)
 
     # Gather weights per segment and fuse scaling into weights
-    active_w_indices = [weight_indices[i] for i in active_indices]
+    active_w_indices = [int(weight_indices[i]) for i in active_indices]
     gathered_w = weights[active_w_indices]  # (n_active, weight_out_dim, input_dim)
     scales = scaling_tensor[active_w_indices].float().view(-1, 1, 1)
-    gathered_w = gathered_w * scales.to(gathered_w.dtype)
+    gathered_w = gathered_w * scales.to(device=gathered_w.device, dtype=gathered_w.dtype)
 
     # Single BMM: (n_active, max_seg_len, input_dim) @ (n_active, input_dim, weight_out_dim)
     padded_output = torch.bmm(padded_x, gathered_w.transpose(-1, -2))
@@ -96,7 +96,7 @@ def sgemm_lora_b_fwd(
         return output
 
     n_active = len(active_indices)
-    active_w_indices = [weight_indices[i] for i in active_indices]
+    active_w_indices = [int(weight_indices[i]) for i in active_indices]
 
     # Convert slice_offsets to list for indexing
     slice_offsets_list = slice_offsets.tolist()

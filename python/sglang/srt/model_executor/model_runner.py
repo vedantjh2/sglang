@@ -2725,21 +2725,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             **kwargs,
         )
 
-    def _get_compiled_forward(self):
-        """Lazily compile model.forward for extend path (embedding models)."""
-        if not hasattr(self, "_compiled_forward"):
-            import os
-
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-            )
-            self._compiled_forward = torch.compile(
-                torch.no_grad()(self.model.forward),
-                mode=mode,
-                dynamic=True,
-            )
-        return self._compiled_forward
-
     def forward_extend(
         self,
         forward_batch: ForwardBatch,
@@ -2770,13 +2755,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
-        # Use torch.compile for extend path when enabled (benefits embedding models)
-        forward_fn = self.model.forward
-        if self.server_args.enable_torch_compile and not self.is_generation:
-            forward_fn = self._get_compiled_forward()
-
         return (
-            forward_fn(
+            self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,

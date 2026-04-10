@@ -30,46 +30,59 @@ def sgemm_lora_a_fwd(
     active_lens = [seg_lens_list[i] for i in active_indices]
     active_w_indices = [int(weight_indices[i]) for i in active_indices]
 
-    # Fast path: all active segments equal length → zero-copy view + bmm
-    if len(set(active_lens)) == 1 and sum(active_lens) == total_seq_len:
-        seg_len = active_lens[0]
-        gathered_w = weights[active_w_indices]
-        scales = scaling_tensor[active_w_indices].float().view(-1, 1, 1)
-        gathered_w = gathered_w * scales.to(
-            device=gathered_w.device, dtype=gathered_w.dtype
-        )
-        x3 = inputs.view(n_active, seg_len, input_dim)
-        return torch.bmm(x3, gathered_w.transpose(-1, -2)).reshape(
-            total_seq_len, weight_out_dim
-        )
-
-    # Fallback: per-segment addmm loop (zero-copy views, no padding overhead)
-    output = torch.zeros(
-        total_seq_len, weight_out_dim, dtype=inputs.dtype, device=inputs.device
+    # Build expanded weight matrix: fuse all adapters into one large matmul
+    # weights[active]: (n_active, weight_out_dim, input_dim)
+    gathered_w = weights[active_w_indices]
+    # Apply per-adapter scaling into weights
+    scales = scaling_tensor[active_w_indices].float().view(-1, 1, 1)
+    gathered_w = gathered_w * scales.to(
+        device=gathered_w.device, dtype=gathered_w.dtype
     )
-    token_offset = 0
-    for lora_idx, seq_len, rank in zip(
-        weight_indices, seg_len_tensor, lora_ranks[weight_indices]
-    ):
-        if seq_len == 0:
-            continue
-        if rank > 0:
-            x_seq = inputs[token_offset : token_offset + seq_len, :]
-            w_seq = weights[lora_idx, : num_slices * rank, :]
-            out_slice = output[
-                token_offset : token_offset + seq_len, : num_slices * rank
-            ]
-            torch.addmm(
-                out_slice,
-                x_seq,
-                w_seq.T,
-                beta=0,
-                alpha=scaling_tensor[lora_idx].item(),
-                out=out_slice,
-            )
-        token_offset += seq_len
+    # Reshape to (n_active * weight_out_dim, input_dim) for single mm
+    all_w = gathered_w.reshape(-1, input_dim)
 
-    return output
+    # Single large mm: (total_tokens, input_dim) @ (input_dim, n_active * weight_out_dim)
+    all_outputs = torch.mm(inputs, all_w.T)
+    # Shape: (total_tokens, n_active * weight_out_dim)
+
+    # Build gather index: for each token, select the correct adapter's columns
+    # Each token in segment i needs columns [i*weight_out_dim : (i+1)*weight_out_dim]
+    seg_lens_active_t = torch.tensor(active_lens, device=inputs.device)
+    col_offsets = torch.repeat_interleave(
+        torch.arange(n_active, device=inputs.device) * weight_out_dim,
+        seg_lens_active_t,
+    )
+    gather_idx = col_offsets.unsqueeze(1) + torch.arange(
+        weight_out_dim, device=inputs.device
+    )
+    # Shape: (total_active_tokens, weight_out_dim)
+
+    # If there are inactive segments, we need to map active tokens to output positions
+    if len(active_indices) == len(seg_lens_list) and sum(active_lens) == total_seq_len:
+        # All segments active, no gaps — gather directly
+        return all_outputs.gather(1, gather_idx)
+    else:
+        # Some segments inactive — need to place results at correct positions
+        output = torch.zeros(
+            total_seq_len, weight_out_dim, dtype=inputs.dtype, device=inputs.device
+        )
+        # Compute active token positions in the full output
+        active_token_offset = 0
+        full_token_offset = 0
+        for i, seg_len in enumerate(seg_lens_list):
+            if seg_len > 0 and i in active_indices:
+                gathered_result = all_outputs[
+                    active_token_offset : active_token_offset + seg_len
+                ].gather(
+                    1,
+                    gather_idx[active_token_offset : active_token_offset + seg_len],
+                )
+                output[full_token_offset : full_token_offset + seg_len] = (
+                    gathered_result
+                )
+                active_token_offset += seg_len
+            full_token_offset += seg_len
+        return output
 
 
 def sgemm_lora_b_fwd(
@@ -109,61 +122,64 @@ def sgemm_lora_b_fwd(
     n_active = len(active_indices)
     active_lens = [seg_lens_list[i] for i in active_indices]
     active_w_indices = [int(weight_indices[i]) for i in active_indices]
+    all_active = (
+        len(active_indices) == len(seg_lens_list)
+        and sum(active_lens) == total_seq_len
+    )
 
-    # Fast path: all active segments equal length → zero-copy view + bmm per slice
-    if len(set(active_lens)) == 1 and sum(active_lens) == total_seq_len:
-        seg_len = active_lens[0]
-        slice_offsets_list = slice_offsets.tolist()
+    slice_offsets_list = slice_offsets.tolist()
+    seg_lens_active_t = torch.tensor(active_lens, device=inputs.device)
 
-        for slice_idx in range(num_slices):
-            slice_start_in = slice_idx * max_rank
-            slice_end_in = (slice_idx + 1) * max_rank
-            slice_start_out = int(slice_offsets_list[slice_idx])
-            slice_end_out = int(slice_offsets_list[slice_idx + 1])
-            slice_dim = slice_end_out - slice_start_out
+    for slice_idx in range(num_slices):
+        slice_start_in = slice_idx * max_rank
+        slice_end_in = (slice_idx + 1) * max_rank
+        slice_start_out = int(slice_offsets_list[slice_idx])
+        slice_end_out = int(slice_offsets_list[slice_idx + 1])
+        slice_dim = slice_end_out - slice_start_out
 
-            x3 = inputs[:, slice_start_in:slice_end_in].view(
-                n_active, seg_len, max_rank
+        # Input for this slice: (total_tokens, max_rank)
+        input_slice = inputs[:, slice_start_in:slice_end_in]
+
+        # Build expanded weight for this slice: all adapters concatenated
+        # weights[active, slice_start_out:slice_end_out, :] → (n_active, slice_dim, max_rank)
+        gathered_w = weights[active_w_indices, slice_start_out:slice_end_out, :]
+        all_w = gathered_w.reshape(-1, max_rank)  # (n_active * slice_dim, max_rank)
+
+        # Single mm: (total_tokens, max_rank) @ (max_rank, n_active * slice_dim)
+        all_outputs = torch.mm(input_slice, all_w.T)
+        # Shape: (total_tokens, n_active * slice_dim)
+
+        # Gather: select correct adapter's columns per token
+        col_offsets = torch.repeat_interleave(
+            torch.arange(n_active, device=inputs.device) * slice_dim,
+            seg_lens_active_t,
+        )
+        gather_idx = col_offsets.unsqueeze(1) + torch.arange(
+            slice_dim, device=inputs.device
+        )
+
+        if all_active:
+            output[:, slice_start_out:slice_end_out] += all_outputs.gather(
+                1, gather_idx
             )
-            gathered_w = weights[active_w_indices, slice_start_out:slice_end_out, :]
-            bmm_result = torch.bmm(x3, gathered_w.transpose(-1, -2)).reshape(
-                total_seq_len, slice_dim
-            )
-            output[:, slice_start_out:slice_end_out] += bmm_result
-
-        return output
-
-    # Fallback: per-segment × per-slice addmm loop
-    token_offset = 0
-    for lora_idx, seq_len, rank in zip(
-        weight_indices, seg_len_tensor, lora_ranks[weight_indices]
-    ):
-        if seq_len == 0:
-            continue
-        if rank == 0:
-            token_offset += seq_len
-            continue
-
-        for slice_idx in range(num_slices):
-            slice_start_input = slice_idx * rank
-            slice_end_input = (slice_idx + 1) * rank
-
-            slice_start_output = slice_offsets[slice_idx]
-            slice_end_output = slice_offsets[slice_idx + 1]
-
-            x_slice = inputs[
-                token_offset : token_offset + seq_len,
-                slice_start_input:slice_end_input,
-            ]
-            w_slice = weights[lora_idx, slice_start_output:slice_end_output, :rank]
-            out_slice = output[
-                token_offset : token_offset + seq_len,
-                slice_start_output:slice_end_output,
-            ]
-            torch.addmm(
-                out_slice, x_slice, w_slice.T, beta=1, alpha=1, out=out_slice
-            )
-
-        token_offset += seq_len
+        else:
+            active_token_offset = 0
+            full_token_offset = 0
+            for i, seg_len in enumerate(seg_lens_list):
+                if seg_len > 0 and i in active_indices:
+                    gathered = all_outputs[
+                        active_token_offset : active_token_offset + seg_len
+                    ].gather(
+                        1,
+                        gather_idx[
+                            active_token_offset : active_token_offset + seg_len
+                        ],
+                    )
+                    output[
+                        full_token_offset : full_token_offset + seg_len,
+                        slice_start_out:slice_end_out,
+                    ] += gathered
+                    active_token_offset += seg_len
+                full_token_offset += seg_len
 
     return output

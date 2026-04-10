@@ -37,15 +37,6 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device)
-        self._slice_offset_cache: dict = {}
-
-    def _get_slice_offsets(self, *offsets) -> torch.Tensor:
-        """Cache CPU slice offset tensors to avoid per-call allocation."""
-        if offsets not in self._slice_offset_cache:
-            self._slice_offset_cache[offsets] = torch.tensor(
-                offsets, dtype=torch.int32, device="cpu"
-            )
-        return self._slice_offset_cache[offsets]
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -71,13 +62,16 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         **kwargs,
     ) -> torch.Tensor:
         _, weight_out_dim, _ = weights.shape
+        output_offset = torch.tensor(
+            [0, weight_out_dim], dtype=torch.int32, device="cpu"
+        )
         output_tensor = sgemm_lora_b_fwd(
             inputs=x,
             weights=weights,
             weight_indices=self.batch_info.weight_indices_cpu,
             seg_len_tensor=self.batch_info.seg_lens_cpu,
             lora_ranks=self.batch_info.lora_ranks_cpu,
-            slice_offsets=self._get_slice_offsets(0, weight_out_dim),
+            slice_offsets=output_offset,
             base_output=base_output,
         )
 
@@ -130,7 +124,9 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         num_slices = 2
         _, weight_out_dim, _ = gate_up_lora_b.shape
         slice_size = weight_out_dim // num_slices
-        output_offset = self._get_slice_offsets(0, slice_size, weight_out_dim)
+        output_offset = torch.tensor(
+            [0, slice_size, weight_out_dim], dtype=torch.int32, device="cpu"
+        )
 
         lora_a_output = sgemm_lora_a_fwd(
             inputs=x,

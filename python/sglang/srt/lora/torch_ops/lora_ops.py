@@ -17,42 +17,36 @@ def sgemm_lora_a_fwd(
         return torch.zeros(total_seq_len, 0, dtype=inputs.dtype, device=inputs.device)
 
     num_loras, weight_out_dim, _ = weights.shape
+    max_rank = weight_out_dim // num_slices
 
-    output = torch.empty(
-        total_seq_len, weight_out_dim, dtype=inputs.dtype, device=inputs.device
+    output = torch.zeros(
+        total_seq_len, num_slices * max_rank, dtype=inputs.dtype, device=inputs.device
     )
 
-    # Pre-convert to Python types to avoid tensor iteration overhead
-    w_indices = weight_indices.tolist()
-    seg_lens = seg_len_tensor.tolist()
-    ranks = lora_ranks.tolist()
-    scales = scaling_tensor.tolist()
-
     token_offset = 0
-    for i, seg_len in enumerate(seg_lens):
-        if seg_len == 0:
+    for lora_idx, seq_len, rank in zip(
+        weight_indices, seg_len_tensor, lora_ranks[weight_indices]
+    ):
+        if seq_len == 0:
             continue
-        w_idx = w_indices[i]
-        rank = ranks[w_idx]
+
         if rank > 0:
-            ns_rank = num_slices * rank
-            out_slice = output[token_offset : token_offset + seg_len, :ns_rank]
+            x_seq = inputs[token_offset : token_offset + seq_len, :]
+            w_seq = weights[lora_idx, : num_slices * rank, :]
+
+            out_slice = output[
+                token_offset : token_offset + seq_len, : num_slices * rank
+            ]
             torch.addmm(
                 out_slice,
-                inputs[token_offset : token_offset + seg_len],
-                weights[w_idx, :ns_rank].T,
+                x_seq,
+                w_seq.T,
                 beta=0,
-                alpha=scales[w_idx],
+                alpha=scaling_tensor[lora_idx].item(),
                 out=out_slice,
             )
-            # Zero remaining columns if rank < max
-            if ns_rank < weight_out_dim:
-                output[
-                    token_offset : token_offset + seg_len, ns_rank:
-                ].zero_()
-        else:
-            output[token_offset : token_offset + seg_len].zero_()
-        token_offset += seg_len
+
+        token_offset += seq_len
 
     return output
 
@@ -84,39 +78,38 @@ def sgemm_lora_b_fwd(
             total_seq_len, total_output_dim, dtype=inputs.dtype, device=inputs.device
         )
 
-    # Pre-convert to Python types
-    w_indices = weight_indices.tolist()
-    seg_lens = seg_len_tensor.tolist()
-    ranks = lora_ranks.tolist()
-    slice_off = slice_offsets.tolist()
-
     token_offset = 0
-    for i, seg_len in enumerate(seg_lens):
-        if seg_len == 0:
+    for lora_idx, seq_len, rank in zip(
+        weight_indices, seg_len_tensor, lora_ranks[weight_indices]
+    ):
+        if seq_len == 0:
             continue
-        w_idx = w_indices[i]
-        rank = ranks[w_idx]
+
         if rank == 0:
-            token_offset += seg_len
+            token_offset += seq_len
             continue
 
         for slice_idx in range(num_slices):
-            s_in = slice_idx * rank
-            s_out = slice_off[slice_idx]
-            e_out = slice_off[slice_idx + 1]
+            slice_start_input = slice_idx * rank
+            slice_end_input = (slice_idx + 1) * rank
+
+            slice_start_output = slice_offsets[slice_idx]
+            slice_end_output = slice_offsets[slice_idx + 1]
+
+            x_slice = inputs[
+                token_offset : token_offset + seq_len :,
+                slice_start_input:slice_end_input,
+            ]  # (seq_len, rank)
+            w_slice = weights[
+                lora_idx, slice_start_output:slice_end_output, :rank
+            ]  # (slice_dim, rank)
 
             out_slice = output[
-                token_offset : token_offset + seg_len, s_out:e_out
+                token_offset : token_offset + seq_len,
+                slice_start_output:slice_end_output,
             ]
-            torch.addmm(
-                out_slice,
-                inputs[token_offset : token_offset + seg_len, s_in : s_in + rank],
-                weights[w_idx, s_out:e_out, :rank].T,
-                beta=1,
-                alpha=1,
-                out=out_slice,
-            )
+            torch.addmm(out_slice, x_slice, w_slice.T, beta=1, alpha=1, out=out_slice)
 
-        token_offset += seg_len
+        token_offset += seq_len
 
     return output

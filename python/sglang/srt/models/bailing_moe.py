@@ -58,6 +58,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
+    should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -386,6 +387,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             and not should_allreduce_fusion
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            and not should_use_dp_reduce_scatterv()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
@@ -498,8 +500,8 @@ class BailingMoEAttention(nn.Module):
             self.head_dim,
             rotary_dim=self.rotary_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_theta,
-            rope_scaling=config.rope_scaling,
+            base=config.rope_parameters["rope_theta"],
+            rope_scaling=config.rope_parameters,
         )
 
         self.attn = RadixAttention(
@@ -532,6 +534,10 @@ class BailingMoEAttention(nn.Module):
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
             )
+        can_fuse_set_kv = (
+            self.head_dim == self.rotary_emb.rotary_dim
+            and enable_fused_set_kv_buffer(forward_batch)
+        )
         q, k = self.rotary_emb(
             positions,
             q,
@@ -542,7 +548,7 @@ class BailingMoEAttention(nn.Module):
                     layer=self.attn,
                     forward_batch=forward_batch,
                 )
-                if enable_fused_set_kv_buffer(forward_batch)
+                if can_fuse_set_kv
                 else None
             ),
         )
@@ -551,7 +557,7 @@ class BailingMoEAttention(nn.Module):
             k,
             v,
             forward_batch,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=not can_fuse_set_kv,
         )
         attn_output, _ = self.dense(context_layer)
         return attn_output

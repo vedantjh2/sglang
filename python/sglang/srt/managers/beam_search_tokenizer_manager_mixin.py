@@ -18,7 +18,6 @@ from typing import Any, Dict, Optional, Union
 
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
-    BatchMultimodalOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
 )
@@ -53,7 +52,6 @@ class BeamSearchTokenizerManagerMixin:
         recv_obj: Union[
             BatchStrOutput,
             BatchEmbeddingOutput,
-            BatchMultimodalOutput,
             BatchTokenIDOutput,
         ],
         i: int,

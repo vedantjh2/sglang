@@ -316,12 +316,12 @@ class TestPrepareForNewBeamSearch(unittest.TestCase):
         req_to_token_pool.req_to_token = torch.arange(50, device=self.device).reshape(
             5, 10
         )
-        req_to_token_pool.alloc = Mock(return_value=[1, 2, 3])
+        req_to_token_pool.alloc_by_count = Mock(return_value=[1, 2, 3])
         batch.req_to_token_pool = req_to_token_pool
 
         ScheduleBatchBeamSearchMixin._prepare_for_new_beam_search(batch)
 
-        req_to_token_pool.alloc.assert_called_once_with(3)
+        req_to_token_pool.alloc_by_count.assert_called_once_with(3)
         self.assertTrue(
             torch.equal(
                 batch.req_pool_indices, torch.tensor([1, 2, 3], device=self.device)
@@ -371,12 +371,12 @@ class TestPrepareForNewBeamSearch(unittest.TestCase):
         req_to_token_pool.req_to_token = torch.arange(60, device=self.device).reshape(
             6, 10
         )
-        req_to_token_pool.alloc = Mock(return_value=[3, 4, 5])
+        req_to_token_pool.alloc_by_count = Mock(return_value=[3, 4, 5])
         batch.req_to_token_pool = req_to_token_pool
 
         ScheduleBatchBeamSearchMixin._prepare_for_new_beam_search(batch)
 
-        req_to_token_pool.alloc.assert_called_once_with(3)
+        req_to_token_pool.alloc_by_count.assert_called_once_with(3)
         self.assertTrue(
             torch.equal(
                 batch.req_pool_indices,
@@ -420,14 +420,14 @@ class TestPrepareForNewBeamSearch(unittest.TestCase):
         batch.req_pool_indices = torch.tensor([0, 1], device=self.device)
 
         req_to_token_pool = Mock()
-        req_to_token_pool.alloc = Mock()
+        req_to_token_pool.alloc_by_count = Mock()
         batch.req_to_token_pool = req_to_token_pool
 
         original_pool_indices = batch.req_pool_indices.clone()
 
         ScheduleBatchBeamSearchMixin._prepare_for_new_beam_search(batch)
 
-        req_to_token_pool.alloc.assert_not_called()
+        req_to_token_pool.alloc_by_count.assert_not_called()
         self.assertTrue(torch.equal(batch.req_pool_indices, original_pool_indices))
 
     def test_prepare_for_new_beam_search_out_of_memory(self):
@@ -444,7 +444,7 @@ class TestPrepareForNewBeamSearch(unittest.TestCase):
         batch.req_pool_indices = torch.tensor([0], device=self.device)
 
         req_to_token_pool = Mock()
-        req_to_token_pool.alloc = Mock(return_value=None)
+        req_to_token_pool.alloc_by_count = Mock(return_value=None)
         batch.req_to_token_pool = req_to_token_pool
 
         with self.assertRaises(RuntimeError) as context:
@@ -456,21 +456,16 @@ class TestPrepareForNewBeamSearch(unittest.TestCase):
 class TestInitBeamSearchAttributes(unittest.TestCase):
     """Test _init_beam_search_attributes method."""
 
-    @patch(
-        "sglang.srt.managers.schedule_batch_beam_search_mixin.get_global_server_args"
-    )
-    def test_init_beam_search_attributes_enabled(self, mock_get_global_server_args):
+    def test_init_beam_search_attributes_enabled(self):
         """Test initialization when beam search is enabled."""
-        mock_server_args = Mock()
-        mock_server_args.enable_beam_search = True
-        mock_get_global_server_args.return_value = mock_server_args
-
         req = Mock()
 
         sampling_params = Mock()
         sampling_params.n = 3
 
-        ReqBeamSearchMixin._init_beam_search_attributes(req, sampling_params)
+        ReqBeamSearchMixin._init_beam_search_attributes(
+            req, is_beam_search=True, sampling_params=sampling_params
+        )
 
         self.assertTrue(req.is_beam_search)
         self.assertEqual(req.beam_width, 3)
@@ -479,27 +474,24 @@ class TestInitBeamSearchAttributes(unittest.TestCase):
         self.assertIsInstance(req.beam_list, BeamSearchList)
         self.assertIsNone(req._stop_token_ids_cache)
 
-    @patch(
-        "sglang.srt.managers.schedule_batch_beam_search_mixin.get_global_server_args"
-    )
-    def test_init_beam_search_attributes_disabled_flag_false(
-        self, mock_get_global_server_args
-    ):
-        """Test initialization when enable_beam_search flag is False."""
-        mock_server_args = Mock()
-        mock_server_args.enable_beam_search = False
-        mock_get_global_server_args.return_value = mock_server_args
-
-        req = Mock()
+    def test_init_beam_search_attributes_disabled_flag_false(self):
+        """Test initialization when is_beam_search flag is False."""
+        req = Mock(spec=[])
 
         sampling_params = Mock()
         sampling_params.n = 3
 
-        ReqBeamSearchMixin._init_beam_search_attributes(req, sampling_params)
+        ReqBeamSearchMixin._init_beam_search_attributes(
+            req, is_beam_search=False, sampling_params=sampling_params
+        )
 
         self.assertFalse(req.is_beam_search)
-        self.assertEqual(req.beam_width, 0)
-        self.assertEqual(req.beam_candidates, 0)
+        # When is_beam_search is False, beam_width/beam_candidates/beam_list
+        # are not set on the request.
+        self.assertFalse(hasattr(req, "beam_width"))
+        self.assertFalse(hasattr(req, "beam_candidates"))
+        self.assertFalse(hasattr(req, "beam_list"))
+        self.assertIsNone(req._stop_token_ids_cache)
 
 
 class TestStopTokenIds(unittest.TestCase):

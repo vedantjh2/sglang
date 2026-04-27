@@ -98,16 +98,22 @@ class TestBeamSearchDiff(unittest.TestCase):
 
         outputs = engine.generate(prompt, sampling_params=sampling_params)
 
-        sequences = []
-
-        if isinstance(outputs, list):
-            for beam_result in outputs:
-                sequences.append(beam_result["text"])
-        else:
+        # Engine returns a single dict for beam search: top-level fields belong
+        # to the first beam, and the full beam list lives under
+        # meta_info["beam_results"]. See BeamSearchTokenizerManagerMixin
+        # .build_beam_search_out for the canonical shape.
+        if not isinstance(outputs, dict):
             raise ValueError(
-                "Expected list output from sglang engine.generate(). "
-                f"Got type: {type(outputs)}, Output: {outputs}"
+                "Unexpected output shape from sglang engine.generate() for "
+                f"beam search. Got type: {type(outputs)}, Output: {outputs}"
             )
+        beam_results = outputs.get("meta_info", {}).get("beam_results")
+        if not beam_results:
+            raise ValueError(
+                "sglang engine.generate() returned no beam_results. "
+                f"Output: {outputs}"
+            )
+        sequences: List[str] = [beam_result["text"] for beam_result in beam_results]
 
         engine.shutdown()
 

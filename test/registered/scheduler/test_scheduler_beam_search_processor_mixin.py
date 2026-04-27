@@ -1786,7 +1786,7 @@ class TestCacheFinishedBeamSearch(unittest.TestCase):
         )
         self.assertEqual(kv_indices, expected_kv)
 
-        pool_indices = scheduler.req_to_token_pool.free.call_args[0][0]
+        pool_indices = scheduler.req_to_token_pool.free_by_indices.call_args[0][0]
         self.assertEqual(pool_indices, [0, 1, 2])
 
         self.mock_release_kv_cache.assert_called_once()

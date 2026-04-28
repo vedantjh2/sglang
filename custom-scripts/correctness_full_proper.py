@@ -1,10 +1,28 @@
-"""Full 16-prompt × beam=500 correctness + bench using the framework path."""
+"""Full 16-prompt × beam=500 correctness + bench using the framework path.
+
+Override paths via env vars:
+  SGL_TEST_MODEL_PATH    — model checkpoint dir
+  SGL_TEST_PREFIX_INDEX  — prefix_index-v2.npz file
+  SGL_TEST_INDEX_PY_DIR  — directory containing prefix_index.py
+"""
 import os, sys, time, pickle, argparse
 import numpy as np
-sys.path.insert(0, "/home/jobuser")
 
-MODEL = "/shared/public/sharing/generative-discovery-modeling/candidate_sourcing/checkpoints/sft_stage_b"
-INDEX = "/shared/public/data/herosourcing/avats/semantic-id-training/index/RQ-Kmeans_Index/prefix_index-v2.npz"
+MODEL = os.environ.get(
+    "SGL_TEST_MODEL_PATH",
+    "/shared/public/sharing/generative-discovery-modeling/"
+    "candidate_sourcing/checkpoints/sft_stage_b",
+)
+INDEX = os.environ.get(
+    "SGL_TEST_PREFIX_INDEX",
+    "/shared/public/data/herosourcing/avats/semantic-id-training/"
+    "index/RQ-Kmeans_Index/prefix_index-v2.npz",
+)
+INDEX_PY_DIR = os.environ.get(
+    "SGL_TEST_INDEX_PY_DIR",
+    os.path.dirname(os.path.abspath(__file__)),
+)
+sys.path.insert(0, INDEX_PY_DIR)
 NUM_BEAMS = 500
 MAX_NEW = 3
 NUM_RETURN = 200
@@ -38,7 +56,10 @@ def fmt(tok, p):
 def run_sglang(n_runs=2):
     import sglang as sgl
     from transformers import AutoTokenizer
-    from sglang.srt.managers.beam_constraint import PrefixIndexCustomLogitProcessor
+    # PrefixIndexCustomLogitProcessor lives next to this test file.
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, app_dir)
+    from prefix_index_processor import PrefixIndexCustomLogitProcessor
 
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     formatted = [fmt(tok, p) for p in JOB_PROMPTS]
@@ -53,12 +74,16 @@ def run_sglang(n_runs=2):
     sp = {
         "max_new_tokens": MAX_NEW, "n": NUM_BEAMS,
         "custom_params": {
-            "prefix_index_path": INDEX,
+            "prefix_index_module": "prefix_index",
+            "prefix_index_class": "PrefixIndex",
+            "prefix_index_kwargs": {
+                "index_path": INDEX,
+                "codebook_size": 8192,
+                "num_codebook": 3,
+            },
             "tokenizer_path": MODEL,
             "vocab_size": len(tok),
-            "codebook_size": 8192,
-            "num_codebook": 3,
-            "prefix_index_pythonpath": "/home/jobuser",
+            "module_search_paths": [INDEX_PY_DIR, app_dir],
         },
     }
     clp = PrefixIndexCustomLogitProcessor.to_str()

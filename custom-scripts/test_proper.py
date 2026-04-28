@@ -1,14 +1,38 @@
 """
 Verify the framework-based PrefixIndexCustomLogitProcessor against PR #36 HF.
 
-Same workload as test_correctness.py but uses SamplingParams.custom_logit_processor
-+ custom_params (the proper SGLang dispatch path) instead of env vars.
+Uses SamplingParams.custom_params + engine.generate(custom_logit_processor=...)
+— the standard SGLang dispatch — to apply per-beam prefix-trie constraints.
+
+Defaults to the LinkedIn-internal stage-B checkpoint and PR #36 prefix index.
+Override with --model / --index / --index-py-dir / --app-dir if running in a
+different environment.
 """
 import os, sys, time, argparse
-sys.path.insert(0, "/home/jobuser")
 
-MODEL = "/shared/public/sharing/generative-discovery-modeling/candidate_sourcing/checkpoints/sft_stage_b"
-INDEX = "/shared/public/data/herosourcing/avats/semantic-id-training/index/RQ-Kmeans_Index/prefix_index-v2.npz"
+
+def _default_path(env, fallback):
+    return os.environ.get(env, fallback)
+
+
+MODEL = _default_path(
+    "SGL_TEST_MODEL_PATH",
+    "/shared/public/sharing/generative-discovery-modeling/"
+    "candidate_sourcing/checkpoints/sft_stage_b",
+)
+INDEX = _default_path(
+    "SGL_TEST_PREFIX_INDEX",
+    "/shared/public/data/herosourcing/avats/semantic-id-training/"
+    "index/RQ-Kmeans_Index/prefix_index-v2.npz",
+)
+# Directory containing PR #36's `prefix_index.py`. Defaults to the directory
+# the test itself lives in; override with SGL_TEST_INDEX_PY_DIR if PrefixIndex
+# is shipped from a different package.
+INDEX_PY_DIR = _default_path(
+    "SGL_TEST_INDEX_PY_DIR",
+    os.path.dirname(os.path.abspath(__file__)),
+)
+sys.path.insert(0, INDEX_PY_DIR)
 PROMPT = "Required: 5+ years backend engineering, Python, distributed systems."
 BEAM = 50
 MAX_NEW = 3
@@ -67,10 +91,14 @@ def hf_run():
             for i in range(out.sequences.shape[0])], idx
 
 
-def sg_run(idx):
+def sg_run(idx, app_dir):
     import sglang as sgl
     from transformers import AutoTokenizer
-    from sglang.srt.managers.beam_constraint import PrefixIndexCustomLogitProcessor
+    # PrefixIndexCustomLogitProcessor lives in application-side code; the user
+    # decides where it sits. Here we point at this file's own directory so the
+    # processor module sits next to the test.
+    sys.path.insert(0, app_dir)
+    from prefix_index_processor import PrefixIndexCustomLogitProcessor
 
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     text = fmt(tok)
@@ -79,16 +107,27 @@ def sg_run(idx):
         enable_custom_logit_processor=True,
         dtype="bfloat16", trust_remote_code=True,
     )
+    # Tokenizer path is forwarded into PrefixIndex so its sid_token_offset can
+    # be resolved on the worker; PrefixIndex accepts a `tokenizer` kwarg, but
+    # because tokenizer instances aren't dill-friendly we pass the path and
+    # build it on the worker side. (For simplicity here we omit it — the
+    # PrefixIndex query path that we actually use does not depend on the
+    # tokenizer; sid_token_offset is only used by separate index-build code.)
     sampling_params = {
         "max_new_tokens": MAX_NEW,
         "n": BEAM,
         "custom_params": {
-            "prefix_index_path": INDEX,
+            "prefix_index_module": "prefix_index",
+            "prefix_index_class": "PrefixIndex",
+            "prefix_index_kwargs": {
+                "index_path": INDEX,
+                "codebook_size": 8192,
+                "num_codebook": 3,
+            },
+            # Forward to the worker so PrefixIndex can resolve sid_token_offset.
             "tokenizer_path": MODEL,
             "vocab_size": len(tok),
-            "codebook_size": 8192,
-            "num_codebook": 3,
-            "prefix_index_pythonpath": "/home/jobuser",
+            "module_search_paths": [INDEX_PY_DIR, app_dir],
         },
     }
     out = eng.generate(
@@ -124,8 +163,9 @@ def main():
         tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
         idx = PrefixIndex(index_path=INDEX, codebook_size=8192, num_codebook=3,
                           tokenizer=tok)
+        app_dir = os.path.dirname(os.path.abspath(__file__))
         t0 = time.time()
-        seqs = sg_run(idx)
+        seqs = sg_run(idx, app_dir)
         print(f"SG: {len(seqs)} beams in {time.time()-t0:.1f}s")
         with open("/tmp/sg_proper.txt", "w") as f:
             for s in seqs: f.write(",".join(map(str, s)) + "\n")

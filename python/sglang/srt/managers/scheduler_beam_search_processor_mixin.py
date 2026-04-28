@@ -548,10 +548,13 @@ class SchedulerBeamSearchProcessorMixin:
         max_k = max([req.beam_candidates for req in batch.reqs])
         logprobs = result.logits_output.logprobs
 
-        # Custom-logit-processor hook for beam search.
-        # Standard sampler path bypasses beam search topk, so we invoke the
-        # processor here. No-op when no req has a processor configured.
-        self._apply_beam_search_logit_processor(batch, logprobs)
+        # Custom-logit-processor hook for beam search. Standard sampler path
+        # bypasses beam search topk, so we invoke the processor here. Gated
+        # at the batch level so unconstrained beam search pays nothing.
+        if any(
+            getattr(r, "custom_logit_processor", None) for r in batch.reqs
+        ):
+            self._apply_beam_search_logit_processor(batch, logprobs)
 
         beam_top_token_logprobs = logprobs.topk(max_k, dim=1, sorted=True)
         return beam_top_token_logprobs.indices, beam_top_token_logprobs.values

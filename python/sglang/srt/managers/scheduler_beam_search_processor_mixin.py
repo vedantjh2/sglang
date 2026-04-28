@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.managers.beam_search_type import BeamSearchSequence
+from sglang.srt.managers import beam_constraint as _bc
 from sglang.srt.managers.io_struct import BeamSearchOutput
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
@@ -211,6 +212,12 @@ class SchedulerBeamSearchProcessorMixin:
             logprobs: Log probabilities tensor for all tokens [vocab_size]
             device: Device where tensors are located
         """
+        # Constraint hook (no-op when env var unset).
+        proc = _bc.get("")
+        if proc is not None:
+            l2 = logprobs.unsqueeze(0)
+            proc.apply([()], l2)
+            logprobs = l2.squeeze(0)
         topk_result = logprobs.topk(req.beam_candidates, dim=0, sorted=True)
         top_logprobs_val = topk_result.values.tolist()
         top_logprobs_idx = topk_result.indices.tolist()
@@ -505,11 +512,20 @@ class SchedulerBeamSearchProcessorMixin:
         # beam search does not support custom logit processor
         """
         max_k = max([req.beam_candidates for req in batch.reqs])
-        # Use sorted=True: when requests with different beam_width are batched together,
-        # sorted results are needed to correctly select top beam_width candidates.
-        beam_top_token_logprobs = result.logits_output.logprobs.topk(
-            max_k, dim=1, sorted=True
-        )
+        logprobs = result.logits_output.logprobs
+
+        # Constraint hook (no-op when SGL_BEAM_CONSTRAINT_INDEX_PATH unset).
+        proc = _bc.get("")
+        if proc is not None:
+            beam_states = []
+            for req in batch.reqs:
+                if req.is_retracted:
+                    continue
+                for beam in req.beam_list.incomplete:
+                    beam_states.append(tuple(beam.tokens))
+            proc.apply(beam_states, logprobs)
+
+        beam_top_token_logprobs = logprobs.topk(max_k, dim=1, sorted=True)
         return beam_top_token_logprobs.indices, beam_top_token_logprobs.values
 
     def _process_beam_search_expansion(

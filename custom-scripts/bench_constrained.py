@@ -14,10 +14,22 @@ Both produce 100% valid SIDs (verified separately).
 """
 import argparse, os, sys, time
 import numpy as np
-sys.path.insert(0, "/home/jobuser")
 
-MODEL = "/shared/public/sharing/generative-discovery-modeling/candidate_sourcing/checkpoints/sft_stage_b"
-INDEX = "/shared/public/data/herosourcing/avats/semantic-id-training/index/RQ-Kmeans_Index/prefix_index-v2.npz"
+MODEL = os.environ.get(
+    "SGL_TEST_MODEL_PATH",
+    "/shared/public/sharing/generative-discovery-modeling/"
+    "candidate_sourcing/checkpoints/sft_stage_b",
+)
+INDEX = os.environ.get(
+    "SGL_TEST_PREFIX_INDEX",
+    "/shared/public/data/herosourcing/avats/semantic-id-training/"
+    "index/RQ-Kmeans_Index/prefix_index-v2.npz",
+)
+INDEX_PY_DIR = os.environ.get(
+    "SGL_TEST_INDEX_PY_DIR",
+    os.path.dirname(os.path.abspath(__file__)),
+)
+sys.path.insert(0, INDEX_PY_DIR)
 
 JOB_PROMPTS = [
     "Required: 5+ years backend engineering, Python, distributed systems.",
@@ -122,20 +134,38 @@ def bench_hf(num_beams, max_new, num_return, n_runs):
 def bench_sglang(num_beams, max_new, num_return, n_runs):
     import sglang as sgl
     from transformers import AutoTokenizer
+
+    # Activate the application-side processor through SGLang's standard
+    # CustomLogitProcessor framework — same dispatch as DisallowedTokens-
+    # LogitsProcessor / ThinkingBudgetLogitProcessor.
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, app_dir)
+    from prefix_index_processor import PrefixIndexCustomLogitProcessor
+
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     formatted = [fmt(tok, p) for p in JOB_PROMPTS]
 
-    # Set env vars BEFORE constructing engine so worker processes see them.
-    os.environ["SGL_BEAM_CONSTRAINT_INDEX_PATH"] = INDEX
-    os.environ["SGL_BEAM_CONSTRAINT_TOK_PATH"] = MODEL
-    os.environ["SGL_BEAM_CONSTRAINT_VOCAB_SIZE"] = str(len(tok))
-    os.environ["SGL_BEAM_CONSTRAINT_PYTHONPATH"] = "/home/jobuser"
-
     engine = sgl.Engine(
         model_path=MODEL, enable_beam_search=True, disable_radix_cache=True,
+        enable_custom_logit_processor=True,
         dtype="bfloat16", trust_remote_code=True,
     )
-    sp = {"max_new_tokens": max_new, "n": num_beams}
+    sp = {
+        "max_new_tokens": max_new, "n": num_beams,
+        "custom_params": {
+            "prefix_index_module": "prefix_index",
+            "prefix_index_class": "PrefixIndex",
+            "prefix_index_kwargs": {
+                "index_path": INDEX,
+                "codebook_size": 8192,
+                "num_codebook": 3,
+            },
+            "tokenizer_path": MODEL,
+            "vocab_size": len(tok),
+            "module_search_paths": [INDEX_PY_DIR, app_dir],
+        },
+    }
+    clp = PrefixIndexCustomLogitProcessor.to_str()
     engine.generate(formatted[0], sampling_params={"max_new_tokens": max_new, "n": 4})
 
     per_prompt = []; total_per_run = []
@@ -143,7 +173,8 @@ def bench_sglang(num_beams, max_new, num_return, n_runs):
         run_t0 = time.time()
         for f in formatted:
             t0 = time.time()
-            out = engine.generate(f, sampling_params=sp)
+            out = engine.generate(f, sampling_params=sp,
+                                  custom_logit_processor=clp)
             beams = out.get("meta_info", {}).get("beam_results", [])
             for b in beams[:num_return]:
                 _ = b.get("text", "")

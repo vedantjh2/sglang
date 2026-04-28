@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.managers.beam_search_type import BeamSearchSequence
-from sglang.srt.managers import beam_constraint as _bc
+from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor as _CLP
 from sglang.srt.managers.io_struct import BeamSearchOutput
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
@@ -212,11 +212,15 @@ class SchedulerBeamSearchProcessorMixin:
             logprobs: Log probabilities tensor for all tokens [vocab_size]
             device: Device where tensors are located
         """
-        # Constraint hook (no-op when env var unset).
-        proc = _bc.get("")
-        if proc is not None:
+        # Custom-logit-processor hook for prefill (level-0 mask).
+        clp_str = getattr(req, "custom_logit_processor", None)
+        if clp_str:
+            proc = _CLP.from_str(clp_str)
+            cp = getattr(req.sampling_params, "custom_params", None)
+            params = dict(cp or {})
+            params["__req__"] = req
             l2 = logprobs.unsqueeze(0)
-            proc.apply([()], l2)
+            proc(l2, [params])
             logprobs = l2.squeeze(0)
         topk_result = logprobs.topk(req.beam_candidates, dim=0, sorted=True)
         top_logprobs_val = topk_result.values.tolist()
@@ -488,6 +492,36 @@ class SchedulerBeamSearchProcessorMixin:
         tail_len = min((max_len_tail_str + 1), len(tokens))
         return req.tokenizer.decode(tokens[-tail_len:])
 
+
+    def _apply_beam_search_logit_processor(
+        self, batch, logprobs
+    ):
+        """Invoke per-request custom_logit_processor over per-beam logprobs.
+
+        Mirrors the standard sampler's apply_custom_logit_processor dispatch
+        but slices logits per request (each request's beams occupy a
+        contiguous block) and passes a __req__ reference so processors that
+        need per-beam state can read it from req.beam_list.incomplete — same
+        pattern as ThinkingBudgetLogitProcessor uses on the regular sampler
+        path.
+        """
+        offset = 0
+        for req in batch.reqs:
+            if req.is_retracted:
+                continue
+            n_beams = len(req.beam_list.incomplete)
+            if n_beams == 0:
+                continue
+            clp_str = getattr(req, "custom_logit_processor", None)
+            if clp_str:
+                proc = _CLP.from_str(clp_str)
+                cp = getattr(req.sampling_params, "custom_params", None)
+                params = dict(cp or {})
+                params["__req__"] = req
+                # In-place modification on the slice modifies logprobs.
+                proc(logprobs[offset:offset + n_beams], [params])
+            offset += n_beams
+
     def _extract_beam_topk_data(
         self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -514,16 +548,10 @@ class SchedulerBeamSearchProcessorMixin:
         max_k = max([req.beam_candidates for req in batch.reqs])
         logprobs = result.logits_output.logprobs
 
-        # Constraint hook (no-op when SGL_BEAM_CONSTRAINT_INDEX_PATH unset).
-        proc = _bc.get("")
-        if proc is not None:
-            beam_states = []
-            for req in batch.reqs:
-                if req.is_retracted:
-                    continue
-                for beam in req.beam_list.incomplete:
-                    beam_states.append(tuple(beam.tokens))
-            proc.apply(beam_states, logprobs)
+        # Custom-logit-processor hook for beam search.
+        # Standard sampler path bypasses beam search topk, so we invoke the
+        # processor here. No-op when no req has a processor configured.
+        self._apply_beam_search_logit_processor(batch, logprobs)
 
         beam_top_token_logprobs = logprobs.topk(max_k, dim=1, sorted=True)
         return beam_top_token_logprobs.indices, beam_top_token_logprobs.values

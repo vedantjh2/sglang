@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import logging
+import time
 from array import array
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    get_dllm_prompt_superblock_tokens,
+)
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -25,6 +31,13 @@ class SchedulerDllmMixin:
             DllmConfig.from_server_args(self.server_args)
             if get_exec().dllm.dllm_algorithm is not None
             else None
+        )
+        self.dllm_idle_coalesce_size = min(
+            max(envs.SGLANG_DLLM_IDLE_COALESCE_SIZE.get(), 0),
+            self.dllm_config.max_running_requests if self.dllm_config is not None else 0,
+        )
+        self.dllm_idle_coalesce_max_wait_seconds = (
+            max(envs.SGLANG_DLLM_IDLE_COALESCE_MAX_WAIT_MS.get(), 0.0) / 1000.0
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
 
@@ -108,16 +121,18 @@ class SchedulerDllmMixin:
                     continue
 
                 next_token_ids = result.next_token_ids[idx]
-                assert len(next_token_ids) == block_size
+                accepted_length = result.accept_length_per_req_cpu[idx]
 
-                if result.accept_length_per_req_cpu[idx] == 0:
+                if accepted_length == 0:
                     # Unresolved: keep partial state and KV for the next FDFO round.
+                    assert len(next_token_ids) == block_size
                     req.dllm_incomplete_ids = array("q", next_token_ids)
                     req.dllm_algo_state = (
                         algo_states[idx] if algo_states is not None else None
                     )
                     continue
 
+                assert len(next_token_ids) == accepted_length
                 req.dllm_incomplete_ids = array("q")
                 req.dllm_algo_state = None
 
@@ -128,7 +143,7 @@ class SchedulerDllmMixin:
                 # full_untruncated_fill_ids when the staging adder truncates the
                 # block to the KV budget.
                 req.full_untruncated_fill_ids[
-                    req.extend_range.end - block_size : req.extend_range.end
+                    req.extend_range.end - accepted_length : req.extend_range.end
                 ] = array("q", next_token_ids)
 
                 len_input = len(req.origin_input_ids)
@@ -162,12 +177,47 @@ class SchedulerDllmMixin:
         max_dllm_capacity = self.dllm_config.max_running_requests - len(
             self.dllm_manager.waiting_queue
         )
+        if self._should_coalesce_idle_dllm_requests():
+            return
+
         num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
 
         if num_requests_to_add > 0:
             requests_to_add = self.waiting_queue[:num_requests_to_add]
             self.dllm_manager.add_waiting_reqs(requests_to_add)
             self.waiting_queue = self.waiting_queue[num_requests_to_add:]
+
+    def _should_coalesce_idle_dllm_requests(self: Scheduler) -> bool:
+        if (
+            envs.SGLANG_DLLM_PREFILL_BLOCKS_PER_FORWARD.get() <= 1
+            or self.dllm_idle_coalesce_size <= 1
+            or not self.dllm_manager.is_empty()
+            or len(self.waiting_queue) >= self.dllm_idle_coalesce_size
+        ):
+            return False
+
+        wait_queue_entry_times = [
+            req.time_stats.wait_queue_entry_time
+            for req in self.waiting_queue
+            if req.time_stats.wait_queue_entry_time > 0
+        ]
+        if not wait_queue_entry_times:
+            return False
+
+        block_size = self.dllm_config.block_size
+        if not any(
+            get_dllm_prompt_superblock_tokens(
+                req,
+                len(req.prefix_indices),
+                block_size,
+            )
+            >= 2 * block_size
+            for req in self.waiting_queue
+        ):
+            return False
+
+        oldest_wait_seconds = time.perf_counter() - min(wait_queue_entry_times)
+        return oldest_wait_seconds < self.dllm_idle_coalesce_max_wait_seconds
 
     def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""
@@ -244,12 +294,14 @@ class SchedulerDllmMixin:
     ) -> None:
         """Process a batch, separating staging and incoming requests."""
         staging_reqs = [req for req in batch if req.dllm_phase == staging_phase]
+        incoming_reqs = [req for req in batch if req.dllm_phase == incoming_phase]
+        adder.set_dllm_ready_req_count(len(staging_reqs) + len(incoming_reqs))
+
         if staging_reqs:
             staging_result = self.process_dllm_staging_reqs(adder, staging_reqs)
             if staging_result != AddReqResult.CONTINUE:
                 return
 
-        incoming_reqs = [req for req in batch if req.dllm_phase == incoming_phase]
         if incoming_reqs:
             self.process_dllm_incoming_reqs(
                 adder, incoming_reqs, running_batch=running_batch

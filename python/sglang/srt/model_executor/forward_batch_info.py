@@ -884,14 +884,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
-            block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
             ret.positions = torch.tensor(
                 [
                     i
-                    for block_offset in (req.dllm_block_offset for req in batch.reqs)
-                    for i in range(block_offset, block_offset + block_size)
+                    for req, extend_len in zip(batch.reqs, batch.extend_lens)
+                    for i in range(
+                        req.dllm_block_offset,
+                        req.dllm_block_offset + extend_len,
+                    )
                 ],
                 dtype=positions_dtype,
             ).to(device, non_blocking=True)

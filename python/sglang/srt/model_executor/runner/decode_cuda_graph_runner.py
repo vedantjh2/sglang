@@ -585,6 +585,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        if (
+            forward_batch.forward_mode.is_dllm_extend()
+            and forward_batch.extend_seq_lens_cpu is not None
+            and any(
+                extend_len != self.captured_req_width
+                for extend_len in forward_batch.extend_seq_lens_cpu
+            )
+        ):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode

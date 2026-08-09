@@ -109,6 +109,31 @@ class DllmAlgorithm:
     ) -> DllmRunOutput:
         batch_size = forward_batch.batch_size
 
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if extend_lens is not None and any(
+            extend_len != self.block_size for extend_len in extend_lens
+        ):
+            if any(
+                extend_len % self.block_size != 0 or extend_len < self.block_size
+                for extend_len in extend_lens
+            ):
+                raise RuntimeError(
+                    "dLLM prompt superblocks must contain complete diffusion blocks."
+                )
+
+            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            next_token_ids_list = [
+                token_ids.tolist()
+                for token_ids in torch.split(forward_batch.input_ids, extend_lens)
+            ]
+            return (
+                out.logits_output,
+                next_token_ids_list,
+                extend_lens,
+                [None] * batch_size,
+                out.can_run_graph,
+            )
+
         if algo_states is None:
             algo_states = [None] * batch_size
         fresh: Optional[List[Any]] = None

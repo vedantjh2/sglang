@@ -487,6 +487,26 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
+def get_dllm_prompt_superblock_tokens(
+    req: Req,
+    prefix_len: int,
+    block_size: int,
+) -> int:
+    if not req.is_dllm_prefill() or req.dllm_incomplete_ids:
+        return 0
+
+    known_prompt_tokens = max(len(req.origin_input_ids) - prefix_len, 0)
+    known_prompt_blocks = known_prompt_tokens // block_size * block_size
+    remaining_output_tokens = max(
+        req.sampling_params.max_new_tokens - len(req.output_ids),
+        0,
+    )
+    if known_prompt_blocks < max(remaining_output_tokens, block_size):
+        return 0
+
+    return known_prompt_blocks
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -636,6 +656,16 @@ class PrefillAdder:
         max_running_reqs = dllm_config.max_running_requests
 
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
+        self.dllm_ready_reqs_remaining = 0
+
+    def set_dllm_ready_req_count(self, count: int) -> None:
+        self.dllm_ready_reqs_remaining = count
+
+    def _mark_dllm_req_admitted(self) -> None:
+        self.dllm_ready_reqs_remaining = max(
+            self.dllm_ready_reqs_remaining - 1,
+            0,
+        )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -909,12 +939,45 @@ class PrefillAdder:
 
         return _rem_tokens
 
+    def _get_dllm_req_token_limit(self, req: Req, prefix_len: int) -> int:
+        max_req_tokens = self.dllm_block_size
+        prefill_blocks = max(envs.SGLANG_DLLM_PREFILL_BLOCKS_PER_FORWARD.get(), 1)
+        if prefill_blocks > 1:
+            known_prompt_blocks = get_dllm_prompt_superblock_tokens(
+                req,
+                prefix_len,
+                self.dllm_block_size,
+            )
+            if known_prompt_blocks:
+                ready_reqs = max(self.dllm_ready_reqs_remaining, 1)
+                fair_share = (
+                    self.rem_dllm_tokens
+                    // ready_reqs
+                    // self.dllm_block_size
+                    * self.dllm_block_size
+                )
+                max_req_tokens = min(
+                    known_prompt_blocks,
+                    prefill_blocks * self.dllm_block_size,
+                    max(fair_share, self.dllm_block_size),
+                )
+
+        remaining_total_tokens = int(self.rem_total_tokens)
+        if remaining_total_tokens <= 0:
+            remaining_total_tokens = self.rem_dllm_tokens
+
+        return min(
+            self.rem_dllm_tokens,
+            max_req_tokens,
+            remaining_total_tokens,
+        )
+
     def _add_dllm_req(self, req: Req, prefix_len: int):
         # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
         # the diffusion unmask process may have some problems
         # Make sure at least one page is available
         trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
+            self._get_dllm_req_token_limit(req, prefix_len)
             // self.page_size
             * self.page_size
         )
@@ -922,6 +985,7 @@ class PrefillAdder:
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
 
         self.can_run_list.append(req)
+        self._mark_dllm_req_admitted()
 
         self._update_prefill_budget(
             prefix_len,
@@ -943,7 +1007,10 @@ class PrefillAdder:
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
-        _rem_tokens = self._get_dllm_remain_tokens()
+        _rem_tokens = self._get_dllm_req_token_limit(
+            req,
+            len(req.prefix_indices),
+        )
 
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
@@ -958,6 +1025,7 @@ class PrefillAdder:
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
+        self._mark_dllm_req_admitted()
 
         # Update budget: reserve max_new_tokens only if not truncated
         max_new_tokens = (

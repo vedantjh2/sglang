@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 _DLLM_STAGING_PHASES = (DllmReqPhase.STAGING_PREFILL, DllmReqPhase.STAGING_DECODE)
 _DLLM_INCOMING_PHASES = (DllmReqPhase.INCOMING_PREFILL, DllmReqPhase.INCOMING_DECODE)
+_DLLM_MIXED_BATCH_ADMISSION_GRACE_ROUNDS = 16
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -31,6 +32,7 @@ class SchedulerDllmMixin:
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
         self.dllm_mixed_batch_enabled = False
+        self._reset_dllm_mixed_batch_admission_state()
         if self.dllm_config is not None and envs.SGLANG_ENABLE_DLLM_MIXED_BATCH.get():
             # Only FDFO rounds can absorb a mixed round for free: a round there
             # is one denoise step, so a prompt-only row self-finishes on it and
@@ -192,6 +194,9 @@ class SchedulerDllmMixin:
 
     def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""
+        if not self.waiting_queue and self.dllm_manager.is_empty():
+            self._reset_dllm_mixed_batch_admission_state()
+
         if (
             running_batch.batch_is_full or not self.waiting_queue
         ) and self.dllm_manager.is_empty():
@@ -232,12 +237,25 @@ class SchedulerDllmMixin:
         """Process prefill or decode batches for DLLM."""
         forward_mode = ForwardMode.DLLM_EXTEND
 
-        if self.dllm_mixed_batch_enabled:
-            self._process_dllm_batches_mixed(adder, running_batch=running_batch)
-            return forward_mode
+        prefill_reqs = self.dllm_manager.get_prefill_requests()
+        round_capacity = max(
+            self.dllm_manager.max_running_reqs - len(running_batch.reqs), 0
+        )
+        if (
+            self.dllm_mixed_batch_enabled
+            and self._has_active_dllm_admissions()
+            and 0 < len(prefill_reqs) < round_capacity
+        ):
+            decode_reqs = self.dllm_manager.get_decode_requests()
+            if self._should_mix_dllm_batches(
+                num_prefill_reqs=len(prefill_reqs),
+                num_decode_reqs=len(decode_reqs),
+                round_capacity=round_capacity,
+            ):
+                self._process_dllm_batches_mixed(adder, running_batch=running_batch)
+                return forward_mode
 
         # Try prefill batch first
-        prefill_reqs = self.dllm_manager.get_prefill_requests()
         if prefill_reqs:
             self._process_batch_by_phase(
                 adder,
@@ -258,6 +276,49 @@ class SchedulerDllmMixin:
             )
 
         return forward_mode
+
+    def _reset_dllm_mixed_batch_admission_state(self) -> None:
+        self._dllm_mixed_batch_latest_admission_time = 0.0
+        self._dllm_mixed_batch_has_scheduled = False
+        self._dllm_mixed_batch_admission_grace_rounds = 0
+
+    def _has_active_dllm_admissions(self) -> bool:
+        # This intentionally treats a later cohort pulled from the outer
+        # scheduler backlog as active admission. Both continuously arriving
+        # traffic and a backlog larger than max_running_requests benefit from
+        # filling otherwise idle prefill rows with decode work.
+        latest_recv_time = max(
+            (
+                req.time_stats.scheduler_recv_time
+                for req in self.dllm_manager.waiting_queue
+            ),
+            default=self._dllm_mixed_batch_latest_admission_time,
+        )
+        if latest_recv_time > self._dllm_mixed_batch_latest_admission_time:
+            if self._dllm_mixed_batch_has_scheduled:
+                self._dllm_mixed_batch_admission_grace_rounds = (
+                    _DLLM_MIXED_BATCH_ADMISSION_GRACE_ROUNDS
+                )
+            self._dllm_mixed_batch_latest_admission_time = latest_recv_time
+
+        self._dllm_mixed_batch_has_scheduled = True
+        has_active_admissions = self._dllm_mixed_batch_admission_grace_rounds > 0
+        if has_active_admissions:
+            self._dllm_mixed_batch_admission_grace_rounds -= 1
+        return has_active_admissions
+
+    @staticmethod
+    def _should_mix_dllm_batches(
+        num_prefill_reqs: int,
+        num_decode_reqs: int,
+        round_capacity: int,
+    ) -> bool:
+        """Let decode work steal only unused rows from a prefill-first round."""
+        return (
+            num_prefill_reqs > 0
+            and num_decode_reqs > 0
+            and num_prefill_reqs < round_capacity
+        )
 
     def _process_dllm_batches_mixed(
         self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch

@@ -193,7 +193,11 @@ class RadixCacheCpp(BasePrefixCache):
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
-        old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
+        old_prefix_len = (
+            req.kv.cache_protected_len
+            if getattr(req, "owns_private_kv", False)
+            else len(req.prefix_indices) // self.page_size * self.page_size
+        )
         page_aligned_overall_len = kv_len_to_handle // self.page_size * self.page_size
 
         if is_insert:

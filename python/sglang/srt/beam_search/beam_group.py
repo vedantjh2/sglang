@@ -81,6 +81,7 @@ class BeamGroup:
         )
 
         self.frontier_cum_logprobs = torch.zeros(1, dtype=torch.float32, device=device)
+        self.trie_prefix_codes: Optional[torch.Tensor] = None
         self.leaves: List[Optional[BeamNode]] = [None]  # parents of the next tokens
         # num_generated is the launch half's count, num_committed the deferred
         # half's (the true length); generated may lead by one under overlap.
@@ -130,6 +131,10 @@ class BeamGroup:
     def next_step_is_final(self) -> bool:
         """The upcoming selection hits max_new_tokens (decided host-side)."""
         return self.num_generated + 1 >= self.max_new_tokens
+
+    def launch_complete(self) -> bool:
+        """Whether the launch half has already staged the terminal selection."""
+        return self.num_generated >= self.max_new_tokens
 
     def advance_frontier(self, sel: SelectResult, tick: int = 0) -> None:
         """Launch half of one selection step: evolve the frontier tensor and

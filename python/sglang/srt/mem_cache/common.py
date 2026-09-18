@@ -160,6 +160,13 @@ def free_kv_row_segments(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
+        if getattr(req, "owns_private_kv", False) and kwargs.get("chunked", False):
+            # A non-cacheable chunk still owns valid KV that the next chunk must
+            # extend. Preserve its private row mapping without inserting it.
+            end = req.extend_range.end
+            req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, :end
+            ].to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)

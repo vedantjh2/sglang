@@ -33,9 +33,11 @@ class ShapeKey:
     dsa_variant: DSA decode dual-graph variant ("dense" / "sparse"), or None
         when DSA dual-graph capture is not enabled. Composes with variant_label
         so LoRA and DSA variants can be captured independently.
+    beam_trie: Whether this graph captures compact trie-head logits.
     """
 
     size: int
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
     dsa_variant: Optional[str] = None
+    beam_trie: bool = False

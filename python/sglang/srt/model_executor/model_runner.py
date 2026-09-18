@@ -78,7 +78,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_v2_active,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
@@ -648,6 +648,7 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        self.beam_trie_compact_enabled = False
         self.load_model()
         prepare_moe_topk(
             model=self.model,
@@ -678,6 +679,8 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.beam_trie_compact_enabled = self.can_use_compact_beam_trie_head()
+        self.configure_beam_trie_output_heads()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
 
@@ -1256,6 +1259,42 @@ class ModelRunner:
                 tp_rank=self.ps.tp_rank,
                 is_ep_joiner=self.server_args.is_ep_joiner,
             )
+
+    def configure_beam_trie_output_heads(self) -> None:
+        config = (
+            self.model_config.beam_trie_config
+            if self.beam_trie_compact_enabled
+            else None
+        )
+        configured = 0
+        for module in self.model.modules():
+            if isinstance(module, LogitsProcessor):
+                module.configure_beam_trie(config)
+                configured += 1
+        if config is not None and configured == 0:
+            raise RuntimeError(
+                "A model-bundled beam trie was discovered, but the loaded "
+                "generation model has no compatible LogitsProcessor"
+            )
+
+    def can_use_compact_beam_trie_head(self) -> bool:
+        config = self.model_config.beam_trie_config
+        if config is None:
+            return False
+        enabled = (
+            self.device == "cuda"
+            and self.ps.tp_size == 1
+            and self.model_config.quantization is None
+            and getattr(self, "lora_manager", None) is None
+            and get_exec().deterministic.rl_on_policy_target is None
+        )
+        if not enabled:
+            logger.info(
+                "Using dense LM-head scoring for model-bundled beam trie; "
+                "the compact output head requires CUDA, TP=1, an unquantized "
+                "LM head, and no LoRA or RL target."
+            )
+        return enabled
 
     def start_startup_weight_load(self) -> None:
         assert self.startup_weight_load is not None

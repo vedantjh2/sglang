@@ -449,6 +449,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_logprob: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    # Per-row SID codebook depths for trie-conditioned decode batches.
+    beam_trie_levels: Optional[torch.Tensor] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -768,6 +770,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
+        beam_trie_config = model_runner.model_config.beam_trie_config
+        beam_trie_levels = None
+        if (
+            beam_trie_config is not None
+            and model_runner.beam_trie_compact_enabled
+            and batch.forward_mode.is_decode()
+            and batch.reqs
+            and all(req.beam_group is not None for req in batch.reqs)
+        ):
+            max_level = beam_trie_config.num_codebooks - 1
+            row_levels = [
+                min(req.beam_group.num_generated, max_level) for req in batch.reqs
+            ]
+            if batch.beam_tail is not None:
+                for entry in batch.beam_tail.entries:
+                    level = min(entry.group.num_generated, max_level)
+                    row_levels.extend([level] * (entry.end - entry.start))
+            assert len(row_levels) == len(batch.seq_lens)
+            beam_trie_levels = torch.tensor(
+                row_levels,
+                dtype=torch.int64,
+                device=batch.device,
+            )
+
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
         # lengths, so this init_new-time backfill onto the ScheduleBatch is
@@ -806,6 +832,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            beam_trie_levels=beam_trie_levels,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,

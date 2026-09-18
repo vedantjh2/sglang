@@ -28,6 +28,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -131,6 +133,30 @@ class TestInitProfileBatchMode(CustomTestCase):
         self.assertEqual(
             mock_makedirs.call_args.args[0],
             os.path.join("/tmp", "graph_capture_profile"),
+        )
+
+
+class TestBeamTrieGraphAvailability(CustomTestCase):
+    def test_trie_graph_requires_capture(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+
+        self.assertTrue(runner._has_beam_trie_graph(False))
+        self.assertFalse(runner._has_beam_trie_graph(True))
+        runner.capture_beam_trie_graph = True
+        self.assertTrue(runner._has_beam_trie_graph(True))
+
+    def test_stages_depths_with_padding(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.beam_trie_levels_buffer = torch.full((6,), 9, dtype=torch.int64)
+
+        runner._stage_beam_trie_levels(
+            SimpleNamespace(beam_trie_levels=torch.tensor([2, 1, 2, 1])),
+            raw_num_token=4,
+            padded_num_tokens=6,
+        )
+        torch.testing.assert_close(
+            runner.beam_trie_levels_buffer,
+            torch.tensor([2, 1, 2, 1, 0, 0]),
         )
 
 

@@ -131,6 +131,19 @@ class TestJointSelectGolden(CustomTestCase):
         for actual, expected in zip(sel.cum_logprobs.tolist(), [-0.1, -0.2]):
             self.assertAlmostEqual(actual, expected, places=5)
 
+    def test_global_candidate_pool_can_exceed_per_row_width(self):
+        sel = joint_select(
+            T([0.0, -0.1], torch.float32),
+            T([[-0.1, -0.2], [-0.05, -0.3]], torch.float32),
+            T([[10, 11], [20, 21]], torch.int64),
+            T([], torch.int64),
+            beam_width=2,
+            num_output_candidates=4,
+        )
+        survivors, finished = unpack(sel)
+        self.assert_close(survivors, [(-0.1, 0, 10), (-0.15, 1, 20)])
+        self.assertEqual(finished, [])
+
 
 class TestJointSelectDifferential(CustomTestCase):
     def test_random_vs_reference(self):
@@ -218,7 +231,9 @@ class TestBeamGroup(CustomTestCase):
             T([[12, 13], [14, 15]], torch.int64),
             2,
         )
-        self.assertTrue(group.advance_final(fsel))
+        group.advance_final_frontier(fsel)
+        self.assertTrue(group.launch_complete())
+        self.assertTrue(group.commit_pending())
 
         results = group.finalize()
         self.assertEqual(len(results), 2)

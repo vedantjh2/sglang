@@ -306,7 +306,10 @@ class TestTheRemoteConnectorArm(_ModelSourceCase):
         self.assertEqual(config.model_path, pulled)
         # The weights stay where they are; only the metadata was pulled.
         self.assertEqual(config.model_weights, _REMOTE_URL)
-        self.assertEqual(state["allow_pattern"], ["*config.json"])
+        self.assertEqual(
+            state["allow_pattern"],
+            ["*config.json", "*trie_output_head.safetensors"],
+        )
 
     def test_the_record_keeps_the_url_and_the_cache_stays_keyed_on_it(self):
         """Same movement the object-store arm makes: the configuration's path

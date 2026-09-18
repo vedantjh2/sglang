@@ -166,6 +166,41 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         self.assertEqual(req.prefix_indices.shape[0], self.POST_RESET_FILL_LEN)
         self.assertTrue(torch.equal(req.prefix_indices, expected))
 
+    def test_non_cacheable_chunked_req_preserves_private_prefix(self):
+        full_prompt_len = self.POST_RESET_FILL_LEN + 16
+        pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
+        cache = MagicMock()
+        cache.req_to_token_pool = pool
+        initial_prefix = pool.req_to_token[
+            self.POOL_IDX, : self.INITIAL_PREFIX_LEN
+        ].to(dtype=torch.int64, copy=True)
+        req = _make_req(
+            req_pool_idx=self.POOL_IDX,
+            fill_ids=list(range(full_prompt_len)),
+            prefix_indices=initial_prefix,
+            extend_input_len=self.POST_RESET_FILL_LEN - self.INITIAL_PREFIX_LEN,
+            fill_len=self.POST_RESET_FILL_LEN,
+        )
+        req.skip_radix_cache_insert = True
+        req.owns_private_kv = True
+        req.kv.cache_protected_len = 3
+        s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=req)
+
+        Scheduler.get_next_batch_to_run(
+            s, running_batch=s.running_batch, last_batch=s.last_batch
+        )
+
+        expected = pool.req_to_token[self.POOL_IDX, : self.POST_RESET_FILL_LEN].to(
+            dtype=torch.int64
+        )
+        self.assertEqual(req.prefix_indices.shape[0], self.POST_RESET_FILL_LEN)
+        self.assertTrue(torch.equal(req.prefix_indices, expected))
+        self.assertEqual(
+            len(req.full_untruncated_fill_ids) - len(req.prefix_indices), 16
+        )
+        self.assertEqual(req.kv.cache_protected_len, 3)
+        cache.cache_unfinished_req.assert_not_called()
+
     def test_no_chunked_req_never_mutates_state(self):
         # The outer `if chunked_req is not None` guard must hold on the retract
         # path that clears chunked_req.

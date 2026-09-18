@@ -1242,6 +1242,7 @@ class Req(ReqDllmMixin):
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        self.owns_private_kv = False
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -3388,6 +3389,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
+                and not (
+                    self.reqs[i].beam_group is not None
+                    and self.reqs[i].beam_group.launch_complete()
+                )
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 

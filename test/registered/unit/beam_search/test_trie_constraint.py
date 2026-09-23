@@ -32,9 +32,7 @@ class TestBeamTrieConstraint(CustomTestCase):
             "level1_token_ids": torch.tensor([1, 3, 0], dtype=torch.int16),
             "level1_offsets": torch.tensor([0, 2, 3], dtype=torch.int32),
             "level2_offsets": torch.tensor([0, 2, 3, 6], dtype=torch.int32),
-            "level2_token_ids": torch.tensor(
-                [0, 2, 1, 2, 2, 3], dtype=torch.int16
-            ),
+            "level2_token_ids": torch.tensor([0, 2, 1, 2, 2, 3], dtype=torch.int16),
         }
         self.metadata = {
             "format_version": "1",
@@ -160,6 +158,34 @@ class TestBeamTrieConstraint(CustomTestCase):
         self.assertEqual(dense_tokens[0, :2].tolist(), [17, 15])
         self.assertTrue(torch.isneginf(dense_values[0, 2:]).all())
 
+    def test_topk_logprob_normalizes_only_constrained_candidates(self):
+        _, constraint = self.load()
+        compact = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        prefixes = torch.tensor([[0], [2]])
+        raw_values, expected_tokens = constraint.topk_logprobs(
+            [compact],
+            prefixes,
+            depth=1,
+            num_candidates=4,
+            normalizers=[torch.zeros((2, 2))],
+        )
+        with mock.patch(
+            "sglang.srt.beam_search.trie_output_head.use_topk_logprob",
+            return_value=True,
+        ):
+            values, tokens = constraint.topk_logprobs(
+                [compact],
+                prefixes,
+                depth=1,
+                num_candidates=4,
+            )
+
+        torch.testing.assert_close(tokens, expected_tokens)
+        torch.testing.assert_close(
+            values,
+            raw_values - torch.logsumexp(raw_values, dim=-1, keepdim=True),
+        )
+
     def test_root_candidates_pad_wide_beam_with_score_dead_valid_tokens(self):
         _, constraint = self.load()
         values, tokens = constraint.topk_logprobs(
@@ -191,9 +217,7 @@ class TestBeamTrieConstraint(CustomTestCase):
         weight = torch.arange(60, dtype=torch.float32).reshape(30, 2)
         lm_head = SimpleNamespace(weight=weight, quant_method=None)
 
-        actual = processor._compute_mixed_beam_trie_lm_head(
-            hidden, lm_head, depths
-        )
+        actual = processor._compute_mixed_beam_trie_lm_head(hidden, lm_head, depths)
         expected = torch.stack(
             [
                 hidden[0] @ weight[10:14].T,
@@ -258,9 +282,7 @@ class TestBeamTrieConstraint(CustomTestCase):
         )
         empty_model_root = self.root / "empty-model"
         empty_model_root.mkdir()
-        self.assertIsNone(
-            discover_trie_output_head_config(str(empty_model_root))
-        )
+        self.assertIsNone(discover_trie_output_head_config(str(empty_model_root)))
 
     def test_only_discovers_root_artifact(self):
         model_root = self.root / "model-with-nested-artifact"
@@ -290,9 +312,7 @@ class TestBeamTrieConstraint(CustomTestCase):
                 if name != "level2_token_ids"
             },
         )
-        config = load_trie_output_head_config(
-            str(root / TRIE_OUTPUT_HEAD_FILENAME)
-        )
+        config = load_trie_output_head_config(str(root / TRIE_OUTPUT_HEAD_FILENAME))
         with self.assertRaisesRegex(ValueError, "level2_token_ids"):
             BeamTrieConstraint.load(config, "cpu")
 

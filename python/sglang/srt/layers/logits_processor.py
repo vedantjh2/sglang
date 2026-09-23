@@ -816,9 +816,7 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         used_tp_lm_head_all_to_all = False
-        assert not (
-            beam_head_output is not None and self.do_tensor_parallel_all_gather
-        )
+        assert not (beam_head_output is not None and self.do_tensor_parallel_all_gather)
         if self.do_tensor_parallel_all_gather:
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
@@ -959,6 +957,7 @@ class LogitsProcessor(nn.Module):
             depths,
             self._project_beam_trie_lm_head,
             self._transform_beam_trie_normalizer_logits,
+            use_grouped_projection=not self.use_fp32_lm_head,
         )
 
     def _compute_lm_head(

@@ -981,6 +981,9 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.beam_attention_metadata is not None:
+            self.forward_metadata = DecodeMetadata([])
+            return
         kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -1428,9 +1431,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # previously cached context without re-materializing KV tensors (e.g., the
             # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
             if k is None and v is None:
-                assert (
-                    not self.prefill_uses_dequant_workspace
-                ), "KV cache must be provided for ragged attention when using FP4 dequant KV cache"
+                assert not self.prefill_uses_dequant_workspace, "KV cache must be provided for ragged attention when using FP4 dequant KV cache"
                 k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
                 v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
@@ -1508,9 +1509,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        decode_wrapper = self.forward_metadata.decode_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -1527,6 +1525,24 @@ class FlashInferAttnBackend(AttentionBackend):
                     v,
                     *self._kv_write_scales(layer),
                 )
+
+        if not layer.is_cross_attention:
+            from sglang.srt.beam_search.shared_context_attention import (
+                forward as forward_beam_attention,
+            )
+
+            beam_output = forward_beam_attention(
+                q,
+                layer,
+                forward_batch,
+                self.token_to_kv_pool,
+            )
+            if beam_output is not None:
+                return beam_output
+
+        decode_wrapper = self.forward_metadata.decode_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
 
         if self.decode_uses_dequant_workspace:
             kv_cache = (

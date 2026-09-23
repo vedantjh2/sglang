@@ -17,6 +17,7 @@ from sglang.srt.beam_search import (
     materialize_tokens,
     select_final_topk,
 )
+from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -144,6 +145,26 @@ class TestJointSelectGolden(CustomTestCase):
         self.assert_close(survivors, [(-0.1, 0, 10), (-0.15, 1, 20)])
         self.assertEqual(finished, [])
 
+    def test_coordinator_preserves_generic_stop_candidate_pool(self):
+        coordinator = BeamCoordinator(
+            model_config=None,
+            spec_algorithm=None,
+            dllm_enabled=False,
+            max_req_len=0,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            future_map=None,
+        )
+        group = BeamGroup(beam_width=2, stop_token_ids=[99], max_new_tokens=3)
+        tokens, _ = coordinator._select_group(
+            group,
+            T([[-0.1, -0.2, -0.3, -0.4]], torch.float32),
+            T([[99, 1, 2, 3]], torch.int64),
+            tick=0,
+        )
+        self.assertEqual(tokens.tolist(), [1, 2])
+
 
 class TestJointSelectDifferential(CustomTestCase):
     def test_random_vs_reference(self):
@@ -198,6 +219,45 @@ class TestBeamGroup(CustomTestCase):
         defaults = dict(beam_width=2, stop_token_ids=[99], max_new_tokens=3)
         defaults.update(kwargs)
         return BeamGroup(**defaults)
+
+    def test_device_history_matches_backpointer_history(self):
+        groups = [
+            self._make_group(stop_token_ids=[], device_history=False),
+            self._make_group(stop_token_ids=[], device_history=True),
+        ]
+        selections = [
+            run_select(
+                [0.0],
+                [[-0.1, -0.2, -0.3, -0.4]],
+                [[1, 2, 3, 4]],
+                set(),
+                2,
+            ),
+            run_select(
+                [-0.1, -0.2],
+                [[-0.3, -0.1], [-0.05, -0.4]],
+                [[5, 6], [7, 8]],
+                set(),
+                2,
+            ),
+        ]
+        for group in groups:
+            for selection in selections:
+                self.assertFalse(group.advance(selection))
+            final = select_final_topk(
+                group.frontier_cum_logprobs,
+                T([[-0.2, -0.4], [-0.1, -0.5]], torch.float32),
+                T([[9, 10], [11, 12]], torch.int64),
+                2,
+            )
+            self.assertTrue(group.advance_final(final))
+
+        expected = groups[0].finalize()
+        actual = groups[1].finalize()
+        self.assertEqual(
+            [(row.tokens, row.cum_logprob) for row in actual],
+            [(row.tokens, row.cum_logprob) for row in expected],
+        )
 
     def test_lifecycle_eos_and_length_finish(self):
         group = self._make_group()

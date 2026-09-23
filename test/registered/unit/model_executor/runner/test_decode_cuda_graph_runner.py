@@ -116,13 +116,9 @@ class TestInitProfileBatchMode(CustomTestCase):
             os.environ, {_BATCH_CAPTURE: "1"}, clear=False
         ), mock.patch.object(
             mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
-        ), mock.patch.object(
-            mod, "profile"
-        ), mock.patch(
+        ), mock.patch.object(mod, "profile"), mock.patch(
             "torch.profiler.schedule"
-        ), mock.patch(
-            "torch.cuda.memory._record_memory_history"
-        ), mock.patch.object(
+        ), mock.patch("torch.cuda.memory._record_memory_history"), mock.patch.object(
             mod.os, "makedirs"
         ) as mock_makedirs:
             os.environ.pop("SGLANG_TORCH_PROFILER_DIR", None)
@@ -144,6 +140,39 @@ class TestBeamTrieGraphAvailability(CustomTestCase):
         self.assertFalse(runner._has_beam_trie_graph(True))
         runner.capture_beam_trie_graph = True
         self.assertTrue(runner._has_beam_trie_graph(True))
+
+    def test_generic_beam_attention_falls_back_from_cuda_graph(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = False
+        runner.require_mlp_tp_gather = False
+        forward_batch = SimpleNamespace(
+            replace_embeds=None,
+            spec_info=None,
+            batch_size=4,
+            beam_trie_levels=None,
+            beam_attention_metadata=object(),
+        )
+
+        self.assertFalse(runner.can_run_graph(forward_batch))
+
+    @mock.patch.dict(
+        os.environ,
+        {"SGLANG_BEAM_SHARED_CONTEXT_ATTENTION": "true"},
+    )
+    def test_missing_beam_attention_metadata_falls_back_from_cuda_graph(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = False
+        runner.require_mlp_tp_gather = False
+        runner.capture_beam_trie_graph = True
+        forward_batch = SimpleNamespace(
+            replace_embeds=None,
+            spec_info=None,
+            batch_size=4,
+            beam_trie_levels=torch.zeros(4, dtype=torch.int64),
+            beam_attention_metadata=None,
+        )
+
+        self.assertFalse(runner.can_run_graph(forward_batch))
 
     def test_stages_depths_with_padding(self):
         runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
@@ -173,9 +202,7 @@ class TestInitProfileOriginalMode(CustomTestCase):
                 mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
             ), mock.patch.object(mod, "profile") as mock_profile, mock.patch(
                 "torch.profiler.schedule"
-            ) as mock_schedule, mock.patch(
-                "torch.cuda.memory._record_memory_history"
-            ):
+            ) as mock_schedule, mock.patch("torch.cuda.memory._record_memory_history"):
                 for k in (_CAPTURE_TRACE, _BATCH_CAPTURE):
                     if k not in environ:
                         os.environ.pop(k, None)
@@ -208,13 +235,9 @@ class TestOnTraceReadyNaming(CustomTestCase):
             clear=False,
         ), mock.patch.object(
             mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
-        ), mock.patch.object(
-            mod, "profile"
-        ) as mock_profile, mock.patch(
+        ), mock.patch.object(mod, "profile") as mock_profile, mock.patch(
             "torch.profiler.schedule"
-        ), mock.patch(
-            "torch.cuda.memory._record_memory_history"
-        ):
+        ), mock.patch("torch.cuda.memory._record_memory_history"):
             os.environ.pop(_CAPTURE_TRACE, None)
             DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
         on_trace_ready = mock_profile.call_args.kwargs["on_trace_ready"]

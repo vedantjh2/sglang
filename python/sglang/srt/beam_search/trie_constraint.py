@@ -63,9 +63,7 @@ def _validate_grouped_order(
         value_start = int(offsets[group_start])
         value_end = int(offsets[group_end])
         chunk = values[value_start:value_end]
-        invalid = (
-            chunk[1:] <= chunk[:-1] if unique else chunk[1:] < chunk[:-1]
-        )
+        invalid = chunk[1:] <= chunk[:-1] if unique else chunk[1:] < chunk[:-1]
         boundaries = offsets[group_start + 1 : group_end] - value_start - 1
         invalid[boundaries] = False
         if np.any(invalid):
@@ -74,9 +72,7 @@ def _validate_grouped_order(
         if not unique:
             changes = chunk[1:] != chunk[:-1]
             changes[boundaries] = False
-            unique_count += group_end - group_start + int(
-                np.count_nonzero(changes)
-            )
+            unique_count += group_end - group_start + int(np.count_nonzero(changes))
     return len(values) if unique else unique_count
 
 
@@ -160,9 +156,7 @@ class BeamTrieConstraint:
             (b_keys, "level1_token_ids"),
             (c_values, "level2_token_ids"),
         ):
-            if len(values) and (
-                int(values.min()) < 0 or int(values.max()) >= size
-            ):
+            if len(values) and (int(values.min()) < 0 or int(values.max()) >= size):
                 raise ValueError(f"{name} contains an out-of-range SID code")
         if np.any(a_keys[1:] <= a_keys[:-1]):
             raise ValueError("root_token_ids must be sorted and unique")
@@ -191,12 +185,9 @@ class BeamTrieConstraint:
             unique=False,
         )
 
-        ab_dtype = (
-            np.int32 if size**2 - 1 <= np.iinfo(np.int32).max else np.int64
-        )
-        ab_rows = (
-            a_for_b.astype(ab_dtype, copy=False) * size
-            + b_keys.astype(ab_dtype, copy=False)
+        ab_dtype = np.int32 if size**2 - 1 <= np.iinfo(np.int32).max else np.int64
+        ab_rows = a_for_b.astype(ab_dtype, copy=False) * size + b_keys.astype(
+            ab_dtype, copy=False
         )
         level2_masks = None
         level2_sparse = None
@@ -220,20 +211,18 @@ class BeamTrieConstraint:
                 level2_masks[rows, c_values[value_start:value_end]] = True
         else:
             offset_dtype = (
-                np.int32
-                if int(c_offsets[-1]) <= np.iinfo(np.int32).max
-                else np.int64
+                np.int32 if int(c_offsets[-1]) <= np.iinfo(np.int32).max else np.int64
             )
             level2_sparse = _SparseLevel2(
-                keys=torch.from_numpy(
-                    _compact_signed_array(ab_rows, size**2 - 1)
-                ).to(device),
-                offsets=torch.from_numpy(
-                    c_offsets.astype(offset_dtype, copy=False)
-                ).to(device),
-                values=torch.from_numpy(
-                    _compact_signed_array(c_values, size - 1)
-                ).to(device),
+                keys=torch.from_numpy(_compact_signed_array(ab_rows, size**2 - 1)).to(
+                    device
+                ),
+                offsets=torch.from_numpy(c_offsets.astype(offset_dtype, copy=False)).to(
+                    device
+                ),
+                values=torch.from_numpy(_compact_signed_array(c_values, size - 1)).to(
+                    device
+                ),
                 max_children=int(np.diff(c_offsets).max()),
             )
 
@@ -258,14 +247,11 @@ class BeamTrieConstraint:
         sparse = self.level2_sparse
         assert sparse is not None
         size = self.config.codebook_size
-        ab_rows = (
-            prefix_codes[:, 0] * size + prefix_codes[:, 1]
-        ).to(sparse.keys.dtype)
+        ab_rows = (prefix_codes[:, 0] * size + prefix_codes[:, 1]).to(sparse.keys.dtype)
         pair_rows = torch.searchsorted(sparse.keys, ab_rows)
         safe_rows = pair_rows.clamp_max(sparse.keys.numel() - 1)
         valid = ~(
-            (pair_rows == sparse.keys.numel())
-            | (sparse.keys[safe_rows] != ab_rows)
+            (pair_rows == sparse.keys.numel()) | (sparse.keys[safe_rows] != ab_rows)
         )
         if pair_rows.is_cuda:
             torch._assert_async(
@@ -386,10 +372,7 @@ class BeamTrieConstraint:
             and self.level2_sparse is not None
             and pieces
             and pieces[0].is_cuda
-            and all(
-                piece.shape[1] == self.config.codebook_size
-                for piece in pieces
-            )
+            and all(piece.shape[1] == self.config.codebook_size for piece in pieces)
         )
         masks = None if sparse_cuda else self.valid_child_mask(prefix_codes, depth)
         token_start = self.config.token_start_for_depth(depth)
@@ -402,23 +385,27 @@ class BeamTrieConstraint:
             rows = piece.shape[0]
             if rows == 0:
                 continue
-            row_masks = (
-                None if masks is None else masks[row_start : row_start + rows]
-            )
+            row_masks = None if masks is None else masks[row_start : row_start + rows]
             row_start += rows
             x = piece.float()
             if x.shape[1] == size:
                 if normalizers is None:
-                    raise ValueError(
-                        "Compact beam trie logits require full-vocabulary "
-                        "normalizer metadata"
+                    from sglang.srt.beam_search.trie_output_head import (
+                        use_topk_logprob,
                     )
+
+                    if not use_topk_logprob():
+                        raise ValueError(
+                            "Compact beam trie logits require full-vocabulary "
+                            "normalizer metadata"
+                        )
+                else:
+                    normalizer = normalizers[piece_index]
+                    if normalizer.shape != (rows, 2):
+                        raise ValueError(
+                            "Beam trie normalizer rows must match compact logits"
+                        )
                 codebook_logits = x
-                normalizer = normalizers[piece_index]
-                if normalizer.shape != (rows, 2):
-                    raise ValueError(
-                        "Beam trie normalizer rows must match compact logits"
-                    )
             else:
                 token_end = token_start + size
                 if x.shape[1] < token_end:
@@ -447,10 +434,12 @@ class BeamTrieConstraint:
             # token IDs on-trie so a later decode never indexes an empty prefix.
             t = torch.where(torch.isneginf(v), fallback, t)
             if x.shape[1] == size:
-                vals.append(
-                    (v - normalizer[:, :1].float())
-                    - normalizer[:, 1:].float()
-                )
+                if normalizers is None:
+                    vals.append(v - torch.logsumexp(v, dim=-1, keepdim=True))
+                else:
+                    vals.append(
+                        (v - normalizer[:, :1].float()) - normalizer[:, 1:].float()
+                    )
             else:
                 vals.append(v - torch.logsumexp(x, dim=-1, keepdim=True))
             toks.append(t + token_start)

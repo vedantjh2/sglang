@@ -228,9 +228,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             stop_token_ids=stop_token_ids,
             max_new_tokens=max_new_tokens,
             num_return=user_params.n,
-            # Frontier state lives on device: selection consumes device top-2k
-            # tensors in place; only k-sized results ever reach the host.
+            # Frontier state lives on device; only k-sized results reach the host.
             device=self.req_to_token_pool.device,
+            device_history=self.trie_constraint is not None,
         )
         if self.trie_constraint is not None:
             group.trie_prefix_codes = torch.empty(
@@ -463,7 +463,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             top_tokens,
             group.stop_token_ids,
             k,
-            num_output_candidates=group.num_candidates,
+            num_output_candidates=(
+                k if self.trie_constraint is not None else group.num_candidates
+            ),
         )
         group.advance_frontier(sel, tick)
         if self.trie_constraint is not None:
@@ -508,7 +510,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             pieces,
             group.trie_prefix_codes,
             min(group.num_generated, config.num_codebooks - 1),
-            group.num_candidates,
+            group.beam_width,
             normalizers,
         )
 

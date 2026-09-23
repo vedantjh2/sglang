@@ -70,6 +70,7 @@ class BeamGroup:
         max_new_tokens: int,
         num_return: Optional[int] = None,
         device: torch.device | str = "cpu",
+        device_history: bool = False,
     ):
         self.beam_width = beam_width
         self.num_candidates = 2 * beam_width
@@ -89,6 +90,11 @@ class BeamGroup:
         self.num_committed = 0
         self.completed: List[CompletedBeam] = []
         self.state = BeamGroupState.DECODING
+        self.device_history = device_history
+        self._device_tokens: List[torch.Tensor] = []
+        self._device_parents: List[torch.Tensor] = []
+        self._device_final_tokens: Optional[torch.Tensor] = None
+        self._device_final_cum_logprobs: Optional[torch.Tensor] = None
         # Selection results staged by the launch half as (forward tick, sel),
         # consumed in tick order by commit.
         self._pending_steps: List[tuple] = []
@@ -175,6 +181,12 @@ class BeamGroup:
         return False
 
     def _commit_step(self, sel: SelectResult) -> bool:
+        if self.device_history:
+            self._device_tokens.append(sel.next_tokens[: self.beam_width])
+            self._device_parents.append(sel.parent_idx[: self.beam_width])
+            self.num_committed += 1
+            return False
+
         num_survivors = int(sel.num_survivors)
         num_finished = int(sel.num_finished)
         new_len = self.num_committed + 1
@@ -211,6 +223,26 @@ class BeamGroup:
 
     def _commit_final(self, sel: FinalSelect) -> bool:
         new_len = self.num_committed + 1
+        if self.device_history:
+            parent_idx = sel.parent_idx
+            reversed_tokens = [sel.tokens]
+            for tokens, parents in zip(
+                reversed(self._device_tokens),
+                reversed(self._device_parents),
+            ):
+                reversed_tokens.append(tokens[parent_idx])
+                parent_idx = parents[parent_idx]
+            self._device_final_tokens = torch.stack(
+                list(reversed(reversed_tokens)),
+                dim=1,
+            )
+            self._device_final_cum_logprobs = sel.cum_logprobs
+            self._device_tokens.clear()
+            self._device_parents.clear()
+            self.num_committed = new_len
+            self.state = BeamGroupState.FINISHED
+            return True
+
         tokens = sel.tokens.tolist()
         parents = sel.parent_idx.tolist()
         cums = sel.cum_logprobs.tolist()
@@ -247,6 +279,23 @@ class BeamGroup:
     def finalize(self) -> List[BeamResult]:
         """Materialize the top beam_width sequences, best score first."""
         assert self.state == BeamGroupState.FINISHED
+        if self.device_history:
+            assert self._device_final_tokens is not None
+            assert self._device_final_cum_logprobs is not None
+            token_rows = self._device_final_tokens.tolist()
+            cum_logprobs = self._device_final_cum_logprobs.tolist()
+            results = [
+                BeamResult(
+                    tokens=tokens,
+                    cum_logprob=cum_logprob,
+                    beam_score=self.beam_score(cum_logprob, self.num_committed),
+                    matched_token=None,
+                )
+                for tokens, cum_logprob in zip(token_rows, cum_logprobs)
+            ]
+            results.sort(key=lambda r: r.beam_score, reverse=True)
+            return results[: self.beam_width]
+
         results = [
             BeamResult(
                 tokens=materialize_tokens(beam.leaf),

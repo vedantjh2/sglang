@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -451,6 +451,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_prefill_only: bool = False
     # Per-row SID codebook depths for trie-conditioned decode batches.
     beam_trie_levels: Optional[torch.Tensor] = None
+    # Shared-context attention metadata for all-beam decode batches.
+    beam_attention_metadata: Optional[Any] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -793,6 +795,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dtype=torch.int64,
                 device=batch.device,
             )
+        beam_attention_metadata = None
+        if batch.forward_mode.is_decode() and batch.beam_tail is not None:
+            from sglang.srt.beam_search.shared_context_attention import (
+                build_metadata,
+            )
+
+            beam_attention_metadata = build_metadata(batch, model_runner)
 
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
@@ -833,6 +842,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             beam_trie_levels=beam_trie_levels,
+            beam_attention_metadata=beam_attention_metadata,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,

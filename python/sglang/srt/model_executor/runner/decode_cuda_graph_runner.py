@@ -331,9 +331,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if (
-                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
-                ):
+                if not self.model_runner.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
@@ -385,6 +383,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.capture_beam_trie_graph
             else None
         )
+        self.beam_attention_graph_metadata = {}
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -594,12 +593,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if levels is None:
             return
         if levels.ndim != 1 or levels.numel() != raw_num_token:
-            raise RuntimeError(
-                "Per-row beam trie depths must match decode token rows"
-            )
+            raise RuntimeError("Per-row beam trie depths must match decode token rows")
         buffer[:raw_num_token].copy_(levels)
         if padded_num_tokens > raw_num_token:
             buffer[raw_num_token:padded_num_tokens].zero_()
+
+    def _stage_beam_attention_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        graph_size: int,
+    ) -> None:
+        source = getattr(forward_batch, "beam_attention_metadata", None)
+        if source is None:
+            return
+        target = self.beam_attention_graph_metadata.get(graph_size)
+        if target is None:
+            raise RuntimeError(
+                f"No shared-context attention graph metadata for size {graph_size}"
+            )
+        from sglang.srt.beam_search.shared_context_attention import (
+            stage_graph_metadata,
+        )
+
+        stage_graph_metadata(target, source)
 
     def _make_graph_key(
         self,
@@ -750,6 +766,35 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         beam_trie = forward_batch.beam_trie_levels is not None
         if not self._has_beam_trie_graph(beam_trie):
             return False
+        beam_attention_metadata = forward_batch.beam_attention_metadata
+        if beam_trie and beam_attention_metadata is None:
+            from sglang.srt.beam_search.shared_context_attention import (
+                enabled as beam_attention_enabled,
+            )
+
+            if beam_attention_enabled():
+                return False
+        if beam_attention_metadata is not None:
+            if not beam_trie:
+                return False
+            from sglang.srt.beam_search.shared_context_attention import (
+                enabled as beam_attention_enabled,
+                graph_compatible as beam_attention_graph_compatible,
+            )
+
+            if not beam_attention_enabled():
+                return False
+            captured_bs = (
+                cuda_graph_bs
+                if self.disable_padding
+                else self._pad_to_bucket(cuda_graph_bs, self.capture_bs)
+            )
+            if not beam_attention_graph_compatible(
+                beam_attention_metadata,
+                cuda_graph_bs,
+                captured_bs,
+            ):
+                return False
 
         graph_key = self._make_graph_key(
             cuda_graph_bs,
@@ -1029,6 +1074,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
+        beam_attention_metadata = None
+        if beam_trie:
+            graph_size = self._capture_graph_size(bs=bs, num_tokens=num_tokens)
+            if graph_size not in self.beam_attention_graph_metadata:
+                from sglang.srt.beam_search.shared_context_attention import (
+                    build_graph_capture_metadata,
+                )
+
+                self.beam_attention_graph_metadata[graph_size] = (
+                    build_graph_capture_metadata(
+                        num_tokens,
+                        input_ids.device,
+                    )
+                )
+            beam_attention_metadata = self.beam_attention_graph_metadata[graph_size]
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -1056,10 +1117,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             beam_trie_levels=(
-                self.beam_trie_levels_buffer[:num_tokens]
-                if beam_trie
-                else None
+                self.beam_trie_levels_buffer[:num_tokens] if beam_trie else None
             ),
+            beam_attention_metadata=beam_attention_metadata,
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
@@ -1189,9 +1249,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 for dsa_variant in dsa_variants:
                     _set_capture_dsa_variant(dsa_variant)
                     for beam_trie in (
-                        (False, True)
-                        if self.capture_beam_trie_graph
-                        else (False,)
+                        (False, True) if self.capture_beam_trie_graph else (False,)
                     ):
                         with torch_compile_decoration.patch_model(
                             self.model_runner.model,
@@ -1387,6 +1445,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.raw_num_token,
                 self.bs * self.captured_req_width,
             )
+            self._stage_beam_attention_metadata(
+                forward_batch,
+                graph_size_key,
+            )
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
@@ -1451,6 +1513,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch,
             raw_num_token,
             padded_num_tokens,
+        )
+        self._stage_beam_attention_metadata(
+            forward_batch,
+            graph_size_key,
         )
 
         if (
@@ -1625,7 +1691,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
-
                 capture_mode = (
                     CaptureHiddenMode.NULL
                     if self.model_runner.spec_algorithm.is_standalone()

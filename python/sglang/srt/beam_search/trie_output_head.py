@@ -16,27 +16,34 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
+from sglang.srt.environ import envs
+
+_DEFAULT_NORMALIZER_CHUNK_SIZE = 8192
 
 
 @dataclasses.dataclass
 class BeamTrieHeadOutput:
     logits: torch.Tensor
-    normalizer: torch.Tensor
+    normalizer: Optional[torch.Tensor]
+
+
+def use_topk_logprob() -> bool:
+    return envs.SGLANG_BEAM_TRIE_TOPK_LOGPROB.get()
 
 
 class BeamTrieOutputHead:
-    """Projects compact candidates while retaining legacy softmax scores."""
+    """Projects the active SID codebook and optional full-vocabulary scores."""
 
     def __init__(
         self,
         config: TrieOutputHeadConfig,
         vocab_size: int,
-        chunk_size: int = 32768,
+        chunk_size: int = _DEFAULT_NORMALIZER_CHUNK_SIZE,
     ):
         self.config = config
         self.vocab_size = vocab_size
@@ -49,18 +56,41 @@ class BeamTrieOutputHead:
         depths: torch.Tensor,
         project: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         transform: Callable[[torch.Tensor], torch.Tensor],
+        use_grouped_projection: bool = False,
     ) -> BeamTrieHeadOutput:
         start = self.config.token_start
         end = self.config.token_end
-        all_logits = project(hidden_states, weight[start:end]).view(
-            hidden_states.shape[0],
-            self.config.num_codebooks,
-            self.config.codebook_size,
-        )
-        row_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
-        logits = all_logits[row_indices, depths]
-        normalizer = self._stream_normalizer(
-            hidden_states, weight, project, transform
+        logits = None
+        if use_grouped_projection:
+            from sglang.srt.beam_search.trie_kernels import (
+                project_active_codebook_logits,
+            )
+
+            logits = project_active_codebook_logits(
+                hidden_states,
+                weight[start:end],
+                depths,
+                self.config.codebook_size,
+            )
+        if logits is None:
+            all_logits = project(hidden_states, weight[start:end]).view(
+                hidden_states.shape[0],
+                self.config.num_codebooks,
+                self.config.codebook_size,
+            )
+            row_indices = torch.arange(
+                hidden_states.shape[0], device=hidden_states.device
+            )
+            logits = all_logits[row_indices, depths]
+        normalizer = (
+            None
+            if use_topk_logprob()
+            else self._stream_normalizer(
+                hidden_states,
+                weight,
+                project,
+                transform,
+            )
         )
         return BeamTrieHeadOutput(logits, normalizer)
 

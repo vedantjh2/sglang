@@ -21,10 +21,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.beam_search.beam_kernels import (
-    group_beam_rows,
-    ungroup_beam_rows,
-)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -36,111 +32,23 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class BeamAttentionMetadata:
-    num_groups: int
+class BeamAttentionBucket:
+    row_indices: torch.Tensor
     context_slots: torch.Tensor
     context_cu_seqlens: torch.Tensor
     decode_slots: torch.Tensor
     beam_width: int
-    decode_len: int
     decode_lens: torch.Tensor
+
+
+@dataclass
+class BeamAttentionMetadata:
+    buckets: list[BeamAttentionBucket]
+    num_rows: int
 
 
 def enabled() -> bool:
     return envs.SGLANG_BEAM_SHARED_CONTEXT_ATTENTION.get()
-
-
-def _positive_int_env(field) -> int:
-    value = field.get()
-    if value <= 0:
-        raise ValueError(f"{field.name} must be positive, got {value}")
-    return value
-
-
-def graph_beam_width() -> int:
-    return _positive_int_env(envs.SGLANG_BEAM_SHARED_CONTEXT_WIDTH)
-
-
-def graph_max_context() -> int:
-    return _positive_int_env(envs.SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT)
-
-
-def graph_max_decode() -> int:
-    return _positive_int_env(envs.SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE)
-
-
-def graph_compatible(
-    metadata: Optional[BeamAttentionMetadata],
-    num_rows: int,
-    captured_rows: int,
-) -> bool:
-    if metadata is None or num_rows != captured_rows:
-        return False
-    if metadata.beam_width != graph_beam_width():
-        return False
-    return (
-        metadata.num_groups * metadata.beam_width == num_rows
-        and metadata.context_slots.numel() <= metadata.num_groups * graph_max_context()
-        and metadata.decode_len <= graph_max_decode()
-    )
-
-
-def build_graph_capture_metadata(
-    num_rows: int,
-    device: torch.device,
-) -> Optional[BeamAttentionMetadata]:
-    if not enabled():
-        return None
-    beam_width = graph_beam_width()
-    if num_rows < beam_width or num_rows % beam_width:
-        return None
-
-    num_groups = num_rows // beam_width
-    max_context = graph_max_context()
-    max_decode = graph_max_decode()
-    return BeamAttentionMetadata(
-        num_groups=num_groups,
-        context_slots=torch.zeros(
-            num_groups * max_context,
-            dtype=torch.int32,
-            device=device,
-        ),
-        context_cu_seqlens=torch.arange(
-            num_groups + 1,
-            dtype=torch.int32,
-            device=device,
-        ),
-        decode_slots=torch.zeros(
-            (num_groups, max_decode * beam_width),
-            dtype=torch.int32,
-            device=device,
-        ),
-        beam_width=beam_width,
-        decode_len=max_decode,
-        decode_lens=torch.full(
-            (num_groups,),
-            max_decode,
-            dtype=torch.int32,
-            device=device,
-        ),
-    )
-
-
-def stage_graph_metadata(
-    target: BeamAttentionMetadata,
-    source: BeamAttentionMetadata,
-) -> None:
-    if not graph_compatible(
-        source,
-        source.num_groups * source.beam_width,
-        target.num_groups * target.beam_width,
-    ):
-        raise ValueError("Beam attention metadata does not fit the captured graph")
-
-    target.context_slots[: source.context_slots.numel()].copy_(source.context_slots)
-    target.context_cu_seqlens.copy_(source.context_cu_seqlens)
-    target.decode_slots[:, : source.decode_slots.shape[1]].copy_(source.decode_slots)
-    target.decode_lens.fill_(source.decode_len)
 
 
 def build_metadata(
@@ -154,78 +62,95 @@ def build_metadata(
         return None
 
     widths = [entry.end - entry.start + 1 for entry in entries]
-    if len(set(widths)) != 1:
+    if any(width <= 1 for width in widths):
         return None
-    beam_width = widths[0]
-    if beam_width <= 1:
-        return None
-    if len(entries) * beam_width != len(batch.seq_lens):
+    if sum(widths) != len(batch.seq_lens):
         return None
 
     num_base_rows = batch.beam_tail.num_base_rows
-    group_rows_cpu = torch.tensor(
-        [
-            [entry.leader_idx]
-            + list(
-                range(
-                    num_base_rows + entry.start,
-                    num_base_rows + entry.end,
-                )
-            )
-            for entry in entries
-        ],
-        dtype=torch.int64,
-    )
-    group_rows = group_rows_cpu.to(batch.device)
-    req_rows = batch.req_pool_indices[group_rows]
     req_to_token = model_runner.req_to_token_pool.req_to_token
+    entries_by_width: dict[int, list] = {}
+    for entry, beam_width in zip(entries, widths, strict=True):
+        entries_by_width.setdefault(beam_width, []).append(entry)
 
-    context_parts = []
-    decode_parts = []
-    prompt_lens = []
-    decode_lens = []
-    for group_index, entry in enumerate(entries):
-        prompt_len = int(entry.group.prompt_len)
-        seq_len = int(batch.seq_lens_cpu[entry.leader_idx])
-        decode_len = seq_len - prompt_len
-        if decode_len <= 0:
-            return None
-        group_req_rows = req_rows[group_index]
-        context_parts.append(req_to_token[group_req_rows[0], :prompt_len])
-        decode_parts.append(
-            req_to_token[
-                group_req_rows,
-                prompt_len:seq_len,
-            ]
-            .transpose(0, 1)
-            .reshape(-1)
+    buckets = []
+    for beam_width, bucket_entries in entries_by_width.items():
+        group_rows_cpu = torch.tensor(
+            [
+                [entry.leader_idx]
+                + list(
+                    range(
+                        num_base_rows + entry.start,
+                        num_base_rows + entry.end,
+                    )
+                )
+                for entry in bucket_entries
+            ],
+            dtype=torch.int64,
         )
-        prompt_lens.append(prompt_len)
-        decode_lens.append(decode_len)
+        group_rows = group_rows_cpu.to(batch.device)
+        req_rows = batch.req_pool_indices[group_rows]
 
-    if len(set(decode_lens)) != 1:
-        return None
-    decode_len = decode_lens[0]
+        context_parts = []
+        decode_parts = []
+        prompt_lens = []
+        decode_lens = []
+        for group_index, entry in enumerate(bucket_entries):
+            prompt_len = int(entry.group.prompt_len)
+            seq_len = int(batch.seq_lens_cpu[entry.leader_idx])
+            decode_len = seq_len - prompt_len
+            if decode_len <= 0:
+                return None
+            group_req_rows = req_rows[group_index]
+            context_parts.append(req_to_token[group_req_rows[0], :prompt_len])
+            decode_parts.append(
+                req_to_token[
+                    group_req_rows,
+                    prompt_len:seq_len,
+                ]
+                .transpose(0, 1)
+                .reshape(-1)
+            )
+            prompt_lens.append(prompt_len)
+            decode_lens.append(decode_len)
 
-    context_cu_seqlens = torch.tensor(
-        [0, *itertools.accumulate(prompt_lens)],
-        dtype=torch.int32,
-        device=batch.device,
-    )
-    return BeamAttentionMetadata(
-        num_groups=len(entries),
-        context_slots=torch.cat(context_parts),
-        context_cu_seqlens=context_cu_seqlens,
-        decode_slots=torch.stack(decode_parts),
-        beam_width=beam_width,
-        decode_len=decode_len,
-        decode_lens=torch.full(
-            (len(entries),),
-            decode_len,
-            dtype=torch.int32,
-            device=batch.device,
-        ),
-    )
+        max_decode_len = max(decode_lens)
+        padded_decode_parts = []
+        for decode_part in decode_parts:
+            padding = max_decode_len * beam_width - decode_part.numel()
+            if padding:
+                decode_part = torch.cat(
+                    [
+                        decode_part,
+                        torch.zeros(
+                            padding,
+                            dtype=decode_part.dtype,
+                            device=decode_part.device,
+                        ),
+                    ]
+                )
+            padded_decode_parts.append(decode_part)
+
+        buckets.append(
+            BeamAttentionBucket(
+                row_indices=group_rows.to(dtype=torch.int32),
+                context_slots=torch.cat(context_parts),
+                context_cu_seqlens=torch.tensor(
+                    [0, *itertools.accumulate(prompt_lens)],
+                    dtype=torch.int32,
+                    device=batch.device,
+                ),
+                decode_slots=torch.stack(padded_decode_parts),
+                beam_width=beam_width,
+                decode_lens=torch.tensor(
+                    decode_lens,
+                    dtype=torch.int32,
+                    device=batch.device,
+                ),
+            )
+        )
+
+    return BeamAttentionMetadata(buckets=buckets, num_rows=len(batch.seq_lens))
 
 
 def forward(
@@ -242,32 +167,25 @@ def forward(
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
 
-    num_groups = metadata.num_groups
-    beam_width = metadata.beam_width
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim
-    grouped_q = group_beam_rows(
-        q,
-        num_groups,
-        beam_width,
-    ).view(num_groups, beam_width, q_heads, head_dim)
+    flat_q = q.contiguous().view(metadata.num_rows, q_heads, head_dim)
+    output = torch.empty_like(flat_q)
     from sglang.srt.beam_search.shared_context_attention_kernel import (
         shared_context_attention,
     )
 
-    output = shared_context_attention(
-        grouped_q,
-        k_buffer,
-        v_buffer,
-        metadata.context_slots,
-        metadata.context_cu_seqlens,
-        metadata.decode_slots,
-        metadata.decode_lens,
-        softmax_scale=layer.scaling,
-    )
-    flat_output = ungroup_beam_rows(
-        output,
-        num_groups,
-        beam_width,
-    ).view(-1, q_heads, head_dim)
-    return flat_output.view(-1, q_heads * head_dim)
+    for bucket in metadata.buckets:
+        shared_context_attention(
+            flat_q,
+            k_buffer,
+            v_buffer,
+            bucket.row_indices,
+            bucket.context_slots,
+            bucket.context_cu_seqlens,
+            bucket.decode_slots,
+            bucket.decode_lens,
+            output=output,
+            softmax_scale=layer.scaling,
+        )
+    return output.view(-1, q_heads * head_dim)

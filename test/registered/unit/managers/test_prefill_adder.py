@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.managers.schedule_policy as schedule_policy
+from sglang.srt.beam_search.beam_group import BeamGroup
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -101,6 +102,7 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.storage_hit_length = 0
+        req.beam_group = None
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
@@ -119,6 +121,104 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_beam_reservation_admission_and_resume_budget(self):
+        req = self.create_mock_req("beam", priority=0, max_new_tokens=3)
+        req.sampling_params.ignore_eos = False
+        req.full_untruncated_fill_ids = list(range(2))
+        req.last_node = MagicMock()
+        req.beam_group = BeamGroup(
+            beam_width=4,
+            max_new_tokens=3,
+        )
+
+        self.mock_token_allocator.available_size.return_value = 11
+        blocked = self.create_adder(self.create_running_batch())
+        self.assertIs(
+            blocked.add_one_req(
+                req,
+                has_chunked_req=False,
+                truncation_align_size=None,
+            ),
+            AddReqResult.NO_TOKEN,
+        )
+
+        self.mock_token_allocator.available_size.return_value = 12
+        admitted = self.create_adder(self.create_running_batch())
+        self.assertIs(
+            admitted.add_one_req(
+                req,
+                has_chunked_req=False,
+                truncation_align_size=None,
+            ),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual(admitted.rem_total_token_offset, 11)
+
+        req.beam_group.kv_reserved = True
+        self.mock_token_allocator.available_size.return_value = 100
+        resumed = self.create_adder(
+            self.create_running_batch(),
+            beam_kv_reserved_tokens=req.beam_group.remaining_kv_reservation(),
+        )
+        self.assertEqual(resumed.rem_total_tokens, 92)
+        self.assertEqual(resumed._decode_token_budget_for_admission(req, 3), 0)
+
+    def test_normal_chunked_prefill_preserves_decode_budget_timing(self):
+        req = self.create_mock_req("normal", priority=0, max_new_tokens=3)
+        req.full_untruncated_fill_ids = list(range(10))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req,
+                "extend_range",
+                Range(start, end),
+            )
+        )
+        self.mock_token_allocator.available_size.return_value = 100
+
+        for prefix_len, expected_result, expected_offset in (
+            (0, AddReqResult.OTHER, 5),
+            (8, None, 6),
+        ):
+            req.prefix_indices = list(range(prefix_len))
+            adder = self.create_adder(
+                self.create_running_batch(),
+                rem_chunk_tokens=4,
+            )
+            result = (
+                adder.add_one_req(
+                    req,
+                    has_chunked_req=False,
+                    truncation_align_size=None,
+                )
+                if prefix_len == 0
+                else adder.add_chunked_req(req)
+            )
+            self.assertIs(result, expected_result)
+            self.assertEqual(adder.rem_total_token_offset, expected_offset)
+
+    def test_priority_preemption_skips_reserved_beam_groups(self):
+        beam_req = self.create_mock_req("beam", priority=0, max_new_tokens=3)
+        beam_req.beam_group = BeamGroup(
+            beam_width=4,
+            max_new_tokens=3,
+        )
+        beam_req.beam_group.kv_reserved = True
+        normal_req = self.create_mock_req("normal", priority=0, max_new_tokens=10)
+        running_batch = self.create_running_batch([beam_req, normal_req])
+        self.scheduling_order(schedule_low_priority_values_first=False)
+        self.mock_token_allocator.available_size.return_value = 20
+        adder = self.create_adder(
+            running_batch,
+            beam_kv_reserved_tokens=8,
+        )
+        new_req = self.create_mock_req("new", priority=1, max_new_tokens=5)
+
+        self.assertTrue(adder.preempt_to_schedule(new_req))
+        self.assertEqual(adder.preempt_list, [normal_req])
+        running_batch.release_req.assert_called_once()
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

@@ -25,16 +25,18 @@ def _shared_context_attention_kernel(
     q,
     k_buffer,
     v_buffer,
+    row_indices,
     context_slots,
     context_cu_seqlens,
     decode_slots,
     decode_lens,
     output,
     softmax_scale,
-    stride_q_group,
-    stride_q_beam,
+    stride_q_row,
     stride_q_head,
     stride_q_dim,
+    stride_row_group,
+    stride_row_beam,
     stride_k_slot,
     stride_k_head,
     stride_k_dim,
@@ -43,8 +45,7 @@ def _shared_context_attention_kernel(
     stride_v_dim,
     stride_decode_group,
     stride_decode_token,
-    stride_out_group,
-    stride_out_beam,
+    stride_out_row,
     stride_out_head,
     stride_out_dim,
     BEAM_WIDTH: tl.constexpr,
@@ -66,9 +67,13 @@ def _shared_context_attention_kernel(
     beam_mask = beam_offsets < BEAM_WIDTH
     dim_mask = dim_offsets < HEAD_DIM
 
+    rows = tl.load(
+        row_indices + group * stride_row_group + beam_offsets * stride_row_beam,
+        mask=beam_mask,
+        other=0,
+    )
     q_offsets = (
-        group * stride_q_group
-        + beam_offsets[:, None] * stride_q_beam
+        rows[:, None] * stride_q_row
         + q_head * stride_q_head
         + dim_offsets[None, :] * stride_q_dim
     )
@@ -185,8 +190,7 @@ def _shared_context_attention_kernel(
 
     result = accumulator / normalizers[:, None]
     output_offsets = (
-        group * stride_out_group
-        + beam_offsets[:, None] * stride_out_beam
+        rows[:, None] * stride_out_row
         + q_head * stride_out_head
         + dim_offsets[None, :] * stride_out_dim
     )
@@ -201,20 +205,25 @@ def shared_context_attention(
     q: torch.Tensor,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
+    row_indices: torch.Tensor,
     context_slots: torch.Tensor,
     context_cu_seqlens: torch.Tensor,
     decode_slots: torch.Tensor,
     decode_lens: torch.Tensor,
     *,
+    output: torch.Tensor | None = None,
     softmax_scale: float,
 ) -> torch.Tensor:
     """Apply shared prompt and per-beam suffix attention in one Triton kernel."""
-    if q.ndim != 4:
-        raise ValueError(f"Expected grouped Q with 4 dimensions, got {q.shape}")
+    if q.ndim != 3:
+        raise ValueError(f"Expected Q with 3 dimensions, got {q.shape}")
     if k_buffer.ndim != 3 or v_buffer.shape != k_buffer.shape:
         raise ValueError("K/V buffers must have matching [slots, heads, dim] shapes")
 
-    num_groups, beam_width, q_heads, head_dim = q.shape
+    if row_indices.ndim != 2:
+        raise ValueError("Row indices must have shape [groups, beam_width]")
+    num_groups, beam_width = row_indices.shape
+    _, q_heads, head_dim = q.shape
     kv_heads = k_buffer.shape[1]
     if q_heads % kv_heads:
         raise ValueError(f"Q heads {q_heads} must be divisible by KV heads {kv_heads}")
@@ -226,6 +235,10 @@ def shared_context_attention(
         raise ValueError("Decode lengths must contain one value per beam group")
     if context_cu_seqlens.shape != (num_groups + 1,):
         raise ValueError("Context offsets must contain one boundary per beam group")
+    if output is None:
+        output = torch.empty_like(q)
+    elif output.shape != q.shape:
+        raise ValueError("Output must match Q shape")
 
     high_group_count = num_groups >= 6
     block_m = 64 if high_group_count else 128
@@ -234,7 +247,6 @@ def shared_context_attention(
     num_stages = 4 if high_group_count else 3
 
     block_d = triton.next_power_of_2(head_dim)
-    output = torch.empty_like(q)
     grid = (
         num_groups,
         q_heads,
@@ -244,6 +256,7 @@ def shared_context_attention(
         q,
         k_buffer,
         v_buffer,
+        row_indices,
         context_slots,
         context_cu_seqlens,
         decode_slots,
@@ -253,7 +266,8 @@ def shared_context_attention(
         q.stride(0),
         q.stride(1),
         q.stride(2),
-        q.stride(3),
+        row_indices.stride(0),
+        row_indices.stride(1),
         k_buffer.stride(0),
         k_buffer.stride(1),
         k_buffer.stride(2),
@@ -265,7 +279,6 @@ def shared_context_attention(
         output.stride(0),
         output.stride(1),
         output.stride(2),
-        output.stride(3),
         BEAM_WIDTH=beam_width,
         Q_PER_KV=q_heads // kv_heads,
         HEAD_DIM=head_dim,

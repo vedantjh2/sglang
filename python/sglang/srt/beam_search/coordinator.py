@@ -112,6 +112,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
 
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
+    _kv_reserved_groups: List[BeamGroup] = msgspec.field(default_factory=list)
 
     @staticmethod
     def request_beam_width(recv_req) -> int:
@@ -201,6 +202,18 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 f"Beam search needs at least 1 generated token within the "
                 f"context budget (prompt_len={prompt_len}, max_req_len={self.max_req_len})."
             )
+        required_kv_slots = (
+            prompt_len
+            + beam_width * max(max_new_tokens - 1, 0)
+            + self.token_to_kv_pool_allocator.page_size
+        )
+        if required_kv_slots >= self.token_to_kv_pool_allocator.size:
+            return (
+                f"beam_width ({beam_width}) with prompt length {prompt_len} and "
+                f"max_new_tokens {max_new_tokens} needs up to {required_kv_slots} "
+                f"KV slots, but the pool holds only "
+                f"{self.token_to_kv_pool_allocator.size}."
+            )
         stop_token_ids = self._collect_stop_token_ids(req, user_params)
         if self.trie_constraint is not None:
             config = self.trie_constraint.config
@@ -268,6 +281,21 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             and not r.beam_group.retired
             and not r.finished()
         )
+
+    def reserved_kv_tokens(self) -> int:
+        return sum(
+            group.remaining_kv_reservation()
+            for group in self._kv_reserved_groups
+            if not group.retired
+        )
+
+    def reserve_kv_for(self, reqs: Sequence[Req]) -> None:
+        for req in reqs:
+            group = req.beam_group
+            if group is None or group.retired or group.kv_reserved:
+                continue
+            group.kv_reserved = True
+            self._kv_reserved_groups.append(group)
 
     @staticmethod
     def _collect_stop_token_ids(req: Req, user_params) -> List[int]:
@@ -613,6 +641,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # Drops overshoot selections staged after the terminal commit.
             group._pending_steps.clear()
             self._num_live_groups -= 1
+            if group.kv_reserved:
+                group.kv_reserved = False
+                self._kv_reserved_groups.remove(group)
 
     def _stash_next_tokens(self, rows, tokens) -> None:
         # Accepts GPU tensors (decode path, no D2H) or host lists (prefill).

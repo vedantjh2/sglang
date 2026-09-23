@@ -3632,6 +3632,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            beam_kv_reserved_tokens=self.beam_coordinator.reserved_kv_tokens(),
         )
 
         if self.chunked_req is not None:
@@ -3754,6 +3755,7 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None, running_batch
+        self.beam_coordinator.reserve_kv_for(can_run_list)
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]

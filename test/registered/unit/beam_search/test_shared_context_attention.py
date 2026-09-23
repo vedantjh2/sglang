@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
 import math
 import unittest
 from types import SimpleNamespace
@@ -20,14 +19,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.beam_search.shared_context_attention import (
-    BeamAttentionMetadata,
-    build_graph_capture_metadata,
-    build_metadata,
-    forward,
-    graph_compatible,
-    stage_graph_metadata,
-)
+from sglang.srt.beam_search.shared_context_attention import build_metadata, forward
 from sglang.srt.beam_search.shared_context_attention_kernel import (
     shared_context_attention,
 )
@@ -35,18 +27,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-
-_GRAPH_ENV = {
-    "SGLANG_BEAM_SHARED_CONTEXT_ATTENTION": "true",
-    "SGLANG_BEAM_SHARED_CONTEXT_WIDTH": "4",
-    "SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT": "4",
-    "SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE": "3",
-}
-
-_LONG_CONTEXT_GRAPH_ENV = {
-    **_GRAPH_ENV,
-    "SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT": "32768",
-}
 
 
 class TestSharedContextAttentionMetadata(CustomTestCase):
@@ -73,7 +53,6 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
         num_slots = context_len + decode_len * beam_width
 
         q = torch.randn(
-            1,
             beam_width,
             q_heads,
             head_dim,
@@ -88,6 +67,11 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             device=device,
         )
         v_buffer = torch.randn_like(k_buffer)
+        row_indices = torch.arange(
+            beam_width,
+            dtype=torch.int32,
+            device=device,
+        ).view(1, beam_width)
         context_slots = torch.arange(
             context_len,
             dtype=torch.int32,
@@ -111,6 +95,7 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             q,
             k_buffer,
             v_buffer,
+            row_indices,
             context_slots,
             context_cu_seqlens,
             decode_slots,
@@ -123,21 +108,18 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             slot_ids = torch.cat(
                 (
                     context_slots,
-                    decode_slots[
-                        0,
-                        beam_index::beam_width,
-                    ],
+                    decode_slots[0, beam_index::beam_width],
                 )
             ).long()
             for q_head in range(q_heads):
                 kv_head = q_head // (q_heads // kv_heads)
                 keys = k_buffer[slot_ids, kv_head].float()
                 values = v_buffer[slot_ids, kv_head].float()
-                scores = keys @ q[0, beam_index, q_head].float()
+                scores = keys @ q[beam_index, q_head].float()
                 probabilities = torch.softmax(scores * softmax_scale, dim=0)
-                reference[0, beam_index, q_head] = (
-                    probabilities[:, None] * values
-                ).sum(dim=0)
+                reference[beam_index, q_head] = (probabilities[:, None] * values).sum(
+                    dim=0
+                )
 
         torch.testing.assert_close(
             output.float(),
@@ -146,73 +128,69 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             atol=1e-2,
         )
 
-    @patch.dict(os.environ, _LONG_CONTEXT_GRAPH_ENV)
-    def test_graph_metadata_supports_32k_context_capacity(self):
-        target = build_graph_capture_metadata(
-            num_rows=8,
-            device=torch.device("cpu"),
-        )
-
-        self.assertIsNotNone(target)
-        self.assertEqual(target.context_slots.numel(), 2 * 32768)
-        self.assertEqual(target.context_slots.dtype, torch.int32)
-        self.assertEqual(target.decode_slots.dtype, torch.int32)
-        self.assertEqual(target.context_cu_seqlens.tolist(), [0, 1, 2])
-
-    @patch.dict(os.environ, _GRAPH_ENV)
-    def test_graph_metadata_staging(self):
-        target = build_graph_capture_metadata(
-            num_rows=8,
-            device=torch.device("cpu"),
-        )
-        self.assertIsNotNone(target)
-        source = BeamAttentionMetadata(
-            num_groups=2,
-            context_slots=torch.tensor([11, 12, 13, 14, 15]),
-            context_cu_seqlens=torch.tensor([0, 2, 5], dtype=torch.int32),
-            decode_slots=torch.arange(16, 24).view(2, 4),
-            beam_width=4,
-            decode_len=1,
-            decode_lens=torch.ones(2, dtype=torch.int32),
-        )
-
-        self.assertTrue(graph_compatible(source, num_rows=8, captured_rows=8))
-        stage_graph_metadata(target, source)
-
-        self.assertEqual(target.context_slots.tolist(), [11, 12, 13, 14, 15, 0, 0, 0])
-        self.assertEqual(target.context_cu_seqlens.tolist(), [0, 2, 5])
-        self.assertEqual(
-            target.decode_slots.tolist(),
-            [
-                [16, 17, 18, 19, 0, 0, 0, 0, 0, 0, 0, 0],
-                [20, 21, 22, 23, 0, 0, 0, 0, 0, 0, 0, 0],
-            ],
-        )
-        self.assertEqual(target.decode_lens.tolist(), [1, 1])
-
-    @patch.dict(os.environ, _GRAPH_ENV)
-    def test_graph_metadata_rejects_capacity_overflow(self):
-        source = BeamAttentionMetadata(
-            num_groups=2,
-            context_slots=torch.arange(9),
-            context_cu_seqlens=torch.tensor([0, 4, 9], dtype=torch.int32),
-            decode_slots=torch.arange(8).view(2, 4),
-            beam_width=4,
-            decode_len=1,
-            decode_lens=torch.ones(2, dtype=torch.int32),
-        )
-        self.assertFalse(graph_compatible(source, num_rows=8, captured_rows=8))
-
-    @patch.dict(os.environ, _GRAPH_ENV)
-    def test_mixed_batch_falls_back_to_normal_attention(self):
-        entry = SimpleNamespace(start=0, end=3)
+    @patch(
+        "sglang.srt.beam_search.shared_context_attention.enabled",
+        return_value=True,
+    )
+    def test_mixed_width_metadata_and_dispatch(self, _enabled):
+        entries = [
+            SimpleNamespace(
+                leader_idx=leader,
+                start=start,
+                end=end,
+                group=SimpleNamespace(prompt_len=1),
+            )
+            for leader, start, end in ((0, 0, 1), (1, 1, 2), (2, 2, 4))
+        ]
+        seq_lens_cpu = torch.tensor([3, 2, 2, 3, 2, 2, 2], dtype=torch.int32)
         batch = SimpleNamespace(
-            beam_tail=SimpleNamespace(entries=[entry]),
-            seq_lens=torch.ones(5, dtype=torch.int32),
-            seq_lens_cpu=torch.ones(5, dtype=torch.int32),
+            beam_tail=SimpleNamespace(entries=entries, num_base_rows=3),
+            seq_lens=seq_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            req_pool_indices=torch.tensor([10, 11, 12, 13, 14, 15, 16]),
+            device=torch.device("cpu"),
+        )
+        model_runner = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(60, dtype=torch.int32).view(20, 3)
+            )
         )
 
-        self.assertIsNone(build_metadata(batch, SimpleNamespace()))
+        metadata = build_metadata(batch, model_runner)
+
+        self.assertEqual([bucket.beam_width for bucket in metadata.buckets], [2, 3])
+        self.assertEqual(metadata.buckets[0].row_indices.tolist(), [[0, 3], [1, 4]])
+        self.assertEqual(metadata.buckets[0].decode_lens.tolist(), [2, 1])
+        self.assertEqual(metadata.buckets[0].decode_slots[1, 2:].tolist(), [0, 0])
+
+        q = torch.randn(7, 8)[:, ::2]
+        self.assertFalse(q.is_contiguous())
+        with patch(
+            "sglang.srt.beam_search.shared_context_attention_kernel."
+            "shared_context_attention"
+        ) as kernel:
+            output = forward(
+                q,
+                SimpleNamespace(
+                    layer_id=0,
+                    tp_q_head_num=1,
+                    head_dim=4,
+                    scaling=0.5,
+                ),
+                SimpleNamespace(beam_attention_metadata=metadata),
+                SimpleNamespace(
+                    get_kv_buffer=lambda _layer_id: (
+                        torch.empty(1, 1, 4),
+                        torch.empty(1, 1, 4),
+                    )
+                ),
+            )
+
+        self.assertEqual(output.shape, (7, 4))
+        self.assertEqual(kernel.call_count, 2)
+        self.assertTrue(
+            all(call.args[0].is_contiguous() for call in kernel.call_args_list)
+        )
 
 
 if __name__ == "__main__":

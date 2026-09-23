@@ -155,15 +155,11 @@ class TestBeamTrieGraphAvailability(CustomTestCase):
 
         self.assertFalse(runner.can_run_graph(forward_batch))
 
-    @mock.patch.dict(
-        os.environ,
-        {"SGLANG_BEAM_SHARED_CONTEXT_ATTENTION": "true"},
-    )
-    def test_missing_beam_attention_metadata_falls_back_from_cuda_graph(self):
+    def test_shared_attention_beam_batch_falls_back_without_beam_graph_capture(self):
         runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
         runner.ragged_verify_mode = False
         runner.require_mlp_tp_gather = False
-        runner.capture_beam_trie_graph = True
+        runner.capture_beam_trie_graph = False
         forward_batch = SimpleNamespace(
             replace_embeds=None,
             spec_info=None,

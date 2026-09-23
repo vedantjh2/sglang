@@ -117,6 +117,7 @@ class BeamGroup:
         # Running total the GC has returned, so held KV is a host-side
         # arithmetic (allocated - freed) rather than a tensor read.
         self.slots_freed = 0
+        self.kv_reserved = False
 
     @property
     def num_member_rows(self) -> int:
@@ -133,6 +134,12 @@ class BeamGroup:
         # read the launch half's staged tensors, unsafe on the checker's stream.
         held = self.beam_width * (end - start) - self.slots_freed
         return held - (end - start)
+
+    def remaining_kv_reservation(self) -> int:
+        """Unallocated decode slots needed to finish without retracting."""
+        generated_floor = max(self.num_committed, 1)
+        remaining_steps = max(self.max_new_tokens - generated_floor, 0)
+        return self.beam_width * remaining_steps
 
     def next_step_is_final(self) -> bool:
         """The upcoming selection hits max_new_tokens (decided host-side)."""

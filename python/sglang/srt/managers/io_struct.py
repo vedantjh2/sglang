@@ -375,7 +375,7 @@ class GenerateReqInput:
             or has_valid_data(self.audio_data)
         )
 
-    def normalize_batch_and_arguments(self):
+    def normalize_batch_and_arguments(self, *, expand_parallel_sampling: bool = True):
         """
         Normalize the batch size and arguments for the request.
 
@@ -383,6 +383,8 @@ class GenerateReqInput:
         are properly formatted as either single values or batches depending on the input.
         It also handles parallel sampling expansion and sets default values for
         unspecified parameters.
+        With expand_parallel_sampling=False, batched inputs stay logical so
+        each input can be normalized and expanded by the unary request path.
 
         Raises:
             ValueError: If inputs are not properly specified (e.g., none or all of
@@ -402,9 +404,13 @@ class GenerateReqInput:
 
         self._validate_inputs()
         self._determine_batch_size()
+        self.is_input_batch = not self.is_single
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
-        self._handle_parallel_sampling()
+        if expand_parallel_sampling or self.is_single:
+            self._handle_parallel_sampling()
+        else:
+            self.parallel_sample_num = 1
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -470,19 +476,12 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
-    def _sampling_params_beam_width(self) -> int:
-        # 1 means not a beam request.
-        if isinstance(self.sampling_params, dict):
-            return self.sampling_params.get("beam_width") or 1
-        elif isinstance(self.sampling_params, list) and self.sampling_params:
-            return self.sampling_params[0].get("beam_width") or 1
-        return 1
-
-    def _handle_beam_search_parallel_sampling(self) -> int:
-        # No fan-out for beam requests: n means "number of returned sequences".
-        if self._sampling_params_beam_width() > 1:
+    @staticmethod
+    def parallel_sample_count(sampling_params: Dict[str, Any]) -> int:
+        if (sampling_params.get("beam_width") or 1) > 1:
             return 1
-        return self.parallel_sample_num
+        count = sampling_params.get("n", 1)
+        return 1 if count is None else count
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
@@ -491,16 +490,18 @@ class GenerateReqInput:
             self.parallel_sample_num = 1
             return
         elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
+            self.parallel_sample_num = self.parallel_sample_count(self.sampling_params)
         else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            self.parallel_sample_num = self.parallel_sample_count(
+                self.sampling_params[0]
+            )
             for sampling_params in self.sampling_params:
-                if self.parallel_sample_num != sampling_params.get("n", 1):
+                if self.parallel_sample_num != self.parallel_sample_count(
+                    sampling_params
+                ):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
-
-        self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -890,7 +891,12 @@ class GenerateReqInput:
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
-            mm_hashes=self.mm_hashes[i] if self.mm_hashes is not None else None,
+            mm_hashes=(
+                [self.mm_hashes[i]]
+                if self.mm_hashes is not None and isinstance(self.mm_hashes[i], str)
+                else self.mm_hashes[i] if self.mm_hashes is not None else None
+            ),
+            use_audio_in_video=self.use_audio_in_video,
             mm_content_hashes=(
                 self.mm_content_hashes[i]
                 if self.mm_content_hashes is not None
@@ -946,6 +952,8 @@ class GenerateReqInput:
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
+            routing_key=self.routing_key,
+            background=self.background,
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,
             max_thinking_tokens=self.max_thinking_tokens,
@@ -959,6 +967,15 @@ class GenerateReqInput:
             return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
             received_time=self.received_time,
+            need_wait_for_mm_inputs=self.need_wait_for_mm_inputs,
+            num_items_assigned=self.num_items_assigned,
+            encoder_urls=self.encoder_urls,
+            max_dynamic_patch=self.max_dynamic_patch,
+            min_dynamic_patch=self.min_dynamic_patch,
+            image_max_dynamic_patch=self.image_max_dynamic_patch,
+            video_max_dynamic_patch=self.video_max_dynamic_patch,
+            images_config=self.images_config,
+            video_config=self.video_config,
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None

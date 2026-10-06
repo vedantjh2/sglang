@@ -29,7 +29,7 @@ import threading
 import time
 from array import array
 from collections import deque
-from contextlib import nullcontext
+from contextlib import aclosing, nullcontext
 from datetime import datetime
 from enum import Enum
 from functools import lru_cache
@@ -775,7 +775,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.auto_create_handle_loop()
 
         # Normalize the request
-        obj.normalize_batch_and_arguments()
+        if isinstance(obj, GenerateReqInput):
+            obj.normalize_batch_and_arguments(expand_parallel_sampling=False)
+        else:
+            obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -797,6 +800,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
+
+        if isinstance(obj, GenerateReqInput) and obj.is_input_batch:
+            async with aclosing(
+                self._handle_unary_batch_request(obj, request)
+            ) as responses:
+                async for response in responses:
+                    yield response
+            return
 
         self._init_req_state(obj, request)
         try:
@@ -822,8 +833,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
-                    async for response in self._handle_batch_request(obj, request):
-                        yield response
+                    async with aclosing(
+                        self._handle_batch_request(obj, request)
+                    ) as responses:
+                        async for response in responses:
+                            yield response
         except BaseException:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
@@ -1811,6 +1825,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
                     )
 
+    async def _handle_unary_batch_request(
+        self, obj: GenerateReqInput, request: Optional[fastapi.Request] = None
+    ):
+        inputs = [obj[i] for i in range(obj.batch_size)]
+        for item in inputs:
+            if GenerateReqInput.parallel_sample_count(
+                item.sampling_params
+            ) > 1 and isinstance(item.rid, str):
+                item.rid = [item.rid]
+        generators = [self.generate_request(item, request) for item in inputs]
+        if not obj.stream:
+            outputs = await self._collect_batch_responses(generators)
+            yield [
+                response
+                for output in outputs
+                for response in (output if isinstance(output, list) else [output])
+            ]
+        else:
+            offsets = []
+            index = 0
+            for item in inputs:
+                offsets.append(index)
+                index += GenerateReqInput.parallel_sample_count(item.sampling_params)
+            async with aclosing(
+                self._stream_batch_responses(generators, obj.rid, index_offsets=offsets)
+            ) as responses:
+                async for response in responses:
+                    yield response
+
     async def _handle_batch_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1914,8 +1957,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             outputs = await self._collect_batch_responses(generators)
             yield outputs
         else:
-            async for response in self._stream_batch_responses(generators, rids):
-                yield response
+            async with aclosing(
+                self._stream_batch_responses(generators, rids)
+            ) as responses:
+                async for response in responses:
+                    yield response
 
     async def _collect_batch_responses(self, generators):
         tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
@@ -1931,8 +1977,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    async def _stream_batch_responses(self, generators, rids):
+    async def _stream_batch_responses(
+        self, generators, rids, *, index_offsets: Optional[List[int]] = None
+    ):
         rid_to_index = {rid: i for i, rid in enumerate(rids)}
+        offsets = (
+            dict(zip(generators, index_offsets)) if index_offsets is not None else None
+        )
         task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
         try:
             while task_map:
@@ -1944,7 +1995,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     gen = task_map.pop(task)
                     try:
                         result = task.result()
-                        result["index"] = rid_to_index[result["meta_info"]["id"]]
+                        result["index"] = (
+                            offsets[gen] + result.get("index", 0)
+                            if offsets is not None
+                            else rid_to_index[result["meta_info"]["id"]]
+                        )
                         yield result
                         new_task = asyncio.create_task(gen.__anext__())
                         task_map[new_task] = gen
@@ -1960,6 +2015,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(gen.aclose() for gen in generators),
                 return_exceptions=True,
             )
+            if offsets is None:
+                for rid in rids:
+                    if rid in self.rid_to_state:
+                        self.abort_request(rid)
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.

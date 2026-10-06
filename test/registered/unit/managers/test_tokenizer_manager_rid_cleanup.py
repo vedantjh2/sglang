@@ -14,6 +14,7 @@ Covers:
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import msgspec
@@ -36,6 +37,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -443,6 +445,7 @@ def _make_generate_obj(rid, is_single):
     obj = MagicMock(spec=GenerateReqInput)
     obj.routed_dp_rank = None
     obj.is_single = is_single
+    obj.is_input_batch = False
     obj.rid = rid
     obj.received_time = 0.0
     obj.external_trace_header = None
@@ -639,6 +642,171 @@ class TestWaitOneResponseAfterStateFreed(CustomTestCase):
         out = asyncio.run(drive())
         self.assertEqual(out["meta_info"]["id"], rid)
         self.assertEqual(out["text"], "hello")
+
+
+class TestUnaryEquivalentBatching(CustomTestCase):
+    def _manager(self, *, block_stream=False):
+        tm = _make_tm_for_generate(self)
+        tm._dispatch_to_scheduler = Mock()
+        tm.server_args.enable_tokenizer_batch_encode = False
+        tm.server_args.enable_dp_attention = False
+        tm.is_generation = True
+        sent = {}
+        gate = asyncio.Event()
+
+        async def tokenize(obj):
+            return SimpleNamespace(
+                rid=obj.rid,
+                sampling_params=SamplingParams(**obj.sampling_params),
+                input_ids=obj.input_ids or [1],
+                mm_inputs=None,
+                time_stats=tm.rid_to_state[obj.rid].time_stats,
+            )
+
+        def send(tokenized):
+            state = tm.rid_to_state[tokenized.rid]
+            state.dispatched = True
+            sent[tokenized.rid] = (state.obj, tokenized.sampling_params)
+
+        async def wait(obj, request=None):
+            original, params = sent[obj.rid]
+            out = {
+                "text": original.text,
+                "meta_info": {"id": obj.rid},
+                "return_logprob": original.return_logprob,
+                "top_logprobs_num": original.top_logprobs_num,
+                "extra_key": original.extra_key,
+                "input_ids": original.input_ids,
+                "routing_key": original.routing_key,
+                "background": original.background,
+                "beam_width": params.beam_width,
+                "n": params.n,
+            }
+            if params.max_new_tokens == 0:
+                tm.rid_to_state.pop(obj.rid, None)
+                yield out
+                return
+            if obj.stream and not (params.beam_width or 1) > 1:
+                yield out.copy()
+                if block_stream:
+                    await gate.wait()
+                else:
+                    await asyncio.sleep(0)
+            tm.rid_to_state.pop(obj.rid, None)
+            yield out
+
+        tm._tokenize_one_request = tokenize
+        tm._send_one_request = send
+        tm._wait_one_response = wait
+        return tm, sent
+
+    def test_per_input_fanout_is_independent_of_batch_order(self):
+        """A beam's return count must not duplicate or suppress another input."""
+        for params, expected in (
+            ([{"n": 2}, {"n": 2, "beam_width": 4}], ["A", "A", "B"]),
+            ([{"n": 2, "beam_width": 4}, {"n": 2}], ["A", "B", "B"]),
+            ([{"n": 2}, {"n": 3}], ["A", "A", "B", "B", "B"]),
+            ([{"n": 2, "beam_width": 4}, {"n": 1, "beam_width": 8}], ["A", "B"]),
+        ):
+            with self.subTest(params=params):
+
+                async def drive():
+                    tm, _ = self._manager()
+                    obj = GenerateReqInput(
+                        text=["A", "B"], sampling_params=params, rid=["A", "B"]
+                    )
+                    outputs = await tm.generate_request(obj).__anext__()
+                    self.assertEqual([out["text"] for out in outputs], expected)
+                    self.assertEqual(
+                        len({out["meta_info"]["id"] for out in outputs}), len(outputs)
+                    )
+                    self.assertEqual(outputs[0]["n"], params[0]["n"])
+                    self.assertEqual(outputs[-1]["n"], params[1]["n"])
+                    self.assertFalse(tm.rid_to_state)
+
+                asyncio.run(drive())
+
+    def test_per_input_metadata_follows_each_unary_request(self):
+        """Parallel samples retain their own input and response settings."""
+
+        async def drive():
+            tm, _ = self._manager()
+            obj = GenerateReqInput(
+                input_ids=[[10, 11], [20, 21]],
+                sampling_params=[{"n": 2}, {"n": 3}],
+                rid=["A", "B"],
+                return_logprob=[True, False],
+                top_logprobs_num=[2, 5],
+                extra_key=["cache-A", "cache-B"],
+                routing_key="routing",
+                background=True,
+            )
+            outputs = await tm.generate_request(obj).__anext__()
+            self.assertTrue(all(out["routing_key"] == "routing" for out in outputs))
+            self.assertTrue(all(out["background"] for out in outputs))
+            self.assertEqual(
+                [
+                    (
+                        out["input_ids"],
+                        out["return_logprob"],
+                        out["top_logprobs_num"],
+                        out["extra_key"],
+                    )
+                    for out in outputs
+                ],
+                [([10, 11], True, 2, "cache-A")] * 2
+                + [([20, 21], False, 5, "cache-B")] * 3,
+            )
+
+        asyncio.run(drive())
+
+    def test_stream_indexes_follow_flattened_unary_outputs(self):
+        """Interleaved chunks keep input/sample indexes instead of RID order."""
+
+        async def drive():
+            tm, _ = self._manager()
+            obj = GenerateReqInput(
+                text=["A", "B", "C"],
+                sampling_params=[{"n": 2}, {"n": 2, "beam_width": 4}, {"n": 3}],
+                rid=["A", "B", "C"],
+                stream=True,
+            )
+            chunks = [out async for out in tm.generate_request(obj)]
+            expected = ["A", "A", "B", "C", "C", "C"]
+            self.assertEqual({out["index"] for out in chunks}, set(range(6)))
+            for out in chunks:
+                self.assertEqual(out["text"], expected[out["index"]])
+            self.assertFalse(tm.rid_to_state)
+
+        asyncio.run(drive())
+
+    def test_closing_stream_aborts_all_pending_unary_children(self):
+        """Closing a batch stream closes every outstanding per-input request."""
+
+        async def drive():
+            tm, _ = self._manager(block_stream=True)
+            obj = GenerateReqInput(
+                text=["A", "B"],
+                sampling_params=[{"n": 2}, {"n": 3}],
+                rid=["A", "B"],
+                stream=True,
+            )
+            response = tm.generate_request(obj)
+            await response.__anext__()
+            pending = {
+                rid for rid, state in tm.rid_to_state.items() if state.dispatched
+            }
+            self.assertTrue(pending)
+            await response.aclose()
+            aborted = {
+                call.args[0].rid for call in tm._dispatch_to_scheduler.call_args_list
+            }
+            self.assertTrue(pending.issubset(aborted))
+            for rid in pending:
+                tm._handle_abort_req(_make_abort_req(rid))
+            self.assertFalse(tm.rid_to_state)
+
+        asyncio.run(drive())
 
 
 if __name__ == "__main__":

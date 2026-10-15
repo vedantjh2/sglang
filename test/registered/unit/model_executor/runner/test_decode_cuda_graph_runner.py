@@ -22,6 +22,7 @@ lightweight stand-in (with the real precedence helper bound) so no model or
 server is constructed.
 """
 
+import contextlib
 import os
 import tempfile
 import unittest
@@ -33,6 +34,19 @@ import torch
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
+)
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+    EAGLEDraftCudaGraphRunner,
+)
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
+)
+from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
+    FrozenKVMTPCudaGraphRunner,
+)
+from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
+    MultiLayerEagleDraftExtendCudaGraphRunner,
 )
 from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -116,9 +130,13 @@ class TestInitProfileBatchMode(CustomTestCase):
             os.environ, {_BATCH_CAPTURE: "1"}, clear=False
         ), mock.patch.object(
             mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
-        ), mock.patch.object(mod, "profile"), mock.patch(
+        ), mock.patch.object(
+            mod, "profile"
+        ), mock.patch(
             "torch.profiler.schedule"
-        ), mock.patch("torch.cuda.memory._record_memory_history"), mock.patch.object(
+        ), mock.patch(
+            "torch.cuda.memory._record_memory_history"
+        ), mock.patch.object(
             mod.os, "makedirs"
         ) as mock_makedirs:
             os.environ.pop("SGLANG_TORCH_PROFILER_DIR", None)
@@ -133,6 +151,73 @@ class TestInitProfileBatchMode(CustomTestCase):
 
 
 class TestBeamTrieGraphAvailability(CustomTestCase):
+    def test_speculative_capture_preserves_non_beam_override_signatures(self):
+        """Speculative runners must capture without decode-only initialization."""
+        with (
+            get_context().override_server_args(device="cpu", tp_size=2),
+            get_parallel().override(tp_rank=1, tp_group=None),
+            mock.patch.object(mod, "get_available_gpu_memory", return_value=0.0),
+            mock.patch.object(
+                mod.torch_compile_decoration,
+                "patch_model",
+                side_effect=lambda *args, **kwargs: contextlib.nullcontext(None),
+            ),
+        ):
+            for cls in (
+                EAGLEDraftCudaGraphRunner,
+                EAGLEDraftExtendCudaGraphRunner,
+                MultiLayerEagleDraftExtendCudaGraphRunner,
+                FrozenKVMTPCudaGraphRunner,
+            ):
+                with self.subTest(runner=cls.__name__):
+                    runner = cls.__new__(cls)
+                    runner.model_runner = SimpleNamespace(
+                        device="cpu", gpu_id=0, model=None, tp_group=None
+                    )
+                    runner.capture_bs = [1]
+                    runner.compile_bs = []
+                    runner.captured_req_width = 1
+                    runner.record_nolora_graph = False
+                    runner.attention_graph_variants = None
+                    runner._profiler = None
+                    with (
+                        mock.patch.object(
+                            cls,
+                            "capture_one_shape",
+                            autospec=True,
+                            side_effect=RuntimeError("capture boundary reached"),
+                        ),
+                        self.assertRaisesRegex(
+                            RuntimeError, "capture boundary reached"
+                        ),
+                    ):
+                        runner._capture_one_stream()
+
+    def test_capture_prepare_preserves_legacy_override_and_trie_flag(self):
+        """Non-trie captures must not pass new keywords to legacy overrides."""
+
+        class LegacyRunner(DecodeCudaGraphRunner):
+            def capture_prepare(self, size, stream_idx=None, num_tokens=None):
+                raise RuntimeError("legacy capture prepared")
+
+        class TrieRunner(DecodeCudaGraphRunner):
+            def capture_prepare(
+                self, size, stream_idx=None, num_tokens=None, *, beam_trie=False
+            ):
+                raise RuntimeError(f"trie capture prepared: {beam_trie}")
+
+        with get_context().override_server_args(device="cpu"):
+            for cls, beam_trie, expected in (
+                (LegacyRunner, False, "legacy capture prepared"),
+                (TrieRunner, True, "trie capture prepared: True"),
+            ):
+                with self.subTest(runner=cls.__name__):
+                    runner = cls.__new__(cls)
+                    runner.captured_req_width = 1
+                    runner.ragged_verify_mode = False
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        runner.capture_one_shape(1, None, beam_trie=beam_trie)
+
     def test_trie_graph_requires_capture(self):
         runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
 
@@ -198,7 +283,9 @@ class TestInitProfileOriginalMode(CustomTestCase):
                 mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
             ), mock.patch.object(mod, "profile") as mock_profile, mock.patch(
                 "torch.profiler.schedule"
-            ) as mock_schedule, mock.patch("torch.cuda.memory._record_memory_history"):
+            ) as mock_schedule, mock.patch(
+                "torch.cuda.memory._record_memory_history"
+            ):
                 for k in (_CAPTURE_TRACE, _BATCH_CAPTURE):
                     if k not in environ:
                         os.environ.pop(k, None)
@@ -231,9 +318,13 @@ class TestOnTraceReadyNaming(CustomTestCase):
             clear=False,
         ), mock.patch.object(
             mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
-        ), mock.patch.object(mod, "profile") as mock_profile, mock.patch(
+        ), mock.patch.object(
+            mod, "profile"
+        ) as mock_profile, mock.patch(
             "torch.profiler.schedule"
-        ), mock.patch("torch.cuda.memory._record_memory_history"):
+        ), mock.patch(
+            "torch.cuda.memory._record_memory_history"
+        ):
             os.environ.pop(_CAPTURE_TRACE, None)
             DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
         on_trace_ready = mock_profile.call_args.kwargs["on_trace_ready"]

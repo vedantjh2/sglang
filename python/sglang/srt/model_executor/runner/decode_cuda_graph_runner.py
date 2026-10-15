@@ -214,6 +214,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    # Speculative runners inherit capture without running decode initialization.
+    capture_beam_trie_graph: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -332,7 +335,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.supports_target_verify_for_draft():
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
@@ -1236,11 +1241,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.backend, BreakableCudaGraphBackend
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
+        capture_kwargs = {"beam_trie": True} if beam_trie else {}
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs,
             stream_idx=stream_idx,
             num_tokens=num_tokens,
-            beam_trie=beam_trie,
+            **capture_kwargs,
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
